@@ -14,8 +14,9 @@ from pathlib import Path
 from urllib.parse import quote
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
-mcp = FastMCP("yupack")
+mcp = FastMCP("yupack", transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
 
 # ----------------------- 데이터 로드 -----------------------
 _MANIFEST_PATH = Path(__file__).parent / "manifest.json"

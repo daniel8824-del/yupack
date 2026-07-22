@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"python3 - <<'EOF'\\nimport urllib.request, json, re\\nBASE='https://yupack-production.up.railway.app/mcp'\\nsid=[None]\\ndef rpc(method, params=None, rid=1):\\n    h={'Content-Type':'applicatio...",
+  "error": "Exit code 1\nTraceback (most recent call last):\n  File \u001b[35m\"<stdin>\"\u001b[0m, line \u001b[35m20\u001b[0m, in \u001b[35m<module>\u001b[0m\n  File \u001b[35m\"<stdin>\"\u001b[0m, line \u001b[35m8\u001b[0m, in \u001b[35mrpc\u001b[0m\n  File \u001b[35m\"/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/urllib/request.py\"\u001b[0m, line \u001b[35m187\u001b[0m, in \u001b[35murlopen\u001b[0m\n    return \u001b[31mopener.open\u001b[0m\u001b[1;31m(url, data, timeout)\u001b[0m\n           \u001b[31m~~~~~~~~~~~\u001b[0m\u001b[1;31m^^^^^^^^^^^^^^^^^^^^\u001b[0m\n  File \u001b[35m\"/opt/homebrew/C...",
+  "timestamp": "2026-07-22T09:17:30.124Z",
+  "retry_count": 1
+}
