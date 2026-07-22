@@ -1,0 +1,6 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python -m yupack_mcp.server"
+restartPolicyType = "ON_FAILURE"

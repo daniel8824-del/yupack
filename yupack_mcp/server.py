@@ -1,0 +1,378 @@
+"""yupack — 수업용 팩 공방 MCP 서버.
+
+핵심 원칙: 모든 쓰기는 서버 인메모리 팩 버퍼(PACKS)로만 간다. 외부 DB(Neo4j)에는
+절대 쓰지 않는다 (읽기 전용 Cypher만). pack_save로 버퍼를 zip으로 꺼내 받는다.
+"""
+from __future__ import annotations
+import io
+import json
+import os
+import re
+import secrets
+import zipfile
+from pathlib import Path
+from urllib.parse import quote
+
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("yupack")
+
+# ----------------------- 데이터 로드 -----------------------
+_MANIFEST_PATH = Path(__file__).parent / "manifest.json"
+MANIFEST: dict = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
+
+# ----------------------- 인메모리 팩 버퍼 -----------------------
+# pack_name -> {"nodes": {node_id: node_dict}, "edges": [...], "schema_packs": [...]}
+PACKS: dict[str, dict] = {}
+DEFAULT_PACK = "내팩"
+
+_BUNDLES: dict[str, bytes] = {}  # token -> zip bytes (pack_save 다운로드)
+
+_PRIVATE_PREFIXES = ("personal:", "zzdemo:", "class:test:")
+
+
+def _get_pack(pack: str) -> dict:
+    return PACKS.setdefault(pack, {"nodes": {}, "edges": [], "schema_packs": []})
+
+
+def _space_of(node_type: str) -> str | None:
+    for space, info in MANIFEST["spaces"].items():
+        if node_type in info["node_types"]:
+            return space
+    return None
+
+
+def _allowed_relations(from_space: str | None, to_space: str | None) -> list[str] | None:
+    if not from_space or not to_space:
+        return None
+    for me in MANIFEST["meta_edges"]:
+        if me["from_space"] == from_space and me["to_space"] == to_space:
+            return me["relations"]
+    return None
+
+
+def _store_zip(files: dict[str, str]) -> str:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, content in files.items():
+            z.writestr(name, content)
+    tok = secrets.token_urlsafe(8)
+    _BUNDLES[tok] = buf.getvalue()
+    if len(_BUNDLES) > 200:
+        for k in list(_BUNDLES)[:100]:
+            _BUNDLES.pop(k, None)
+    return tok
+
+
+def _safe_filename(label: str) -> str:
+    s = re.sub(r"[^\w가-힣.-]+", "_", label).strip("_")
+    return s or "node"
+
+
+# ----------------------- Neo4j 읽기 전용 -----------------------
+def _neo4j_driver():
+    """env 없으면 None (buffer-only 폴백)."""
+    uri = os.environ.get("NEO4J_URI")
+    user = os.environ.get("NEO4J_USERNAME") or os.environ.get("NEO4J_USER")
+    pw = os.environ.get("NEO4J_PASSWORD")
+    if not (uri and user and pw):
+        return None
+    from neo4j import GraphDatabase  # lazy import
+    return GraphDatabase.driver(uri, auth=(user, pw))
+
+
+def _cloud_search(question: str, limit: int) -> list[dict]:
+    """읽기 전용 Neo4j fulltext/fallback 검색. 개인정보·데모·테스트 노드 제외."""
+    driver = _neo4j_driver()
+    if driver is None:
+        return []
+    database = os.environ.get("NEO4J_DATABASE", "neo4j")
+    privacy_filter = " AND ".join(
+        f"NOT node.id STARTS WITH '{p}'" for p in _PRIVATE_PREFIXES
+    )
+    privacy_filter_n = privacy_filter.replace("node.", "n.")
+    out: list[dict] = []
+    try:
+        with driver.session(database=database) as session:
+            try:
+                res = session.run(
+                    "CALL db.index.fulltext.queryNodes('concept_fulltext', $q) "
+                    f"YIELD node, score WHERE {privacy_filter} "
+                    "RETURN node.id AS id, node.label AS label, node.definition AS definition, "
+                    "score LIMIT $limit",
+                    q=question, limit=limit,
+                )
+                out = [dict(r) for r in res]
+            except Exception:
+                tokens = [t for t in re.split(r"\s+", question.strip()) if t]
+                if not tokens:
+                    return []
+                token = tokens[0]
+                res = session.run(
+                    "MATCH (n:Concept) WHERE n.label CONTAINS $token "
+                    f"AND {privacy_filter_n} "
+                    "RETURN n.id AS id, n.label AS label, n.definition AS definition "
+                    "LIMIT $limit",
+                    token=token, limit=limit,
+                )
+                out = [dict(r) for r in res]
+    finally:
+        driver.close()
+    for r in out:
+        r["source"] = "cloud"
+    return out
+
+
+# ----------------------- 버퍼 검색 -----------------------
+def _tokenize(text: str) -> set[str]:
+    return set(re.findall(r"[\w가-힣]+", (text or "").lower()))
+
+
+def _buffer_search(pack: str, question: str, limit: int) -> list[dict]:
+    q_tokens = _tokenize(question)
+    scored = []
+    for node_id, node in _get_pack(pack)["nodes"].items():
+        label = node.get("properties", {}).get("label", node_id)
+        definition = node.get("properties", {}).get("definition", "")
+        n_tokens = _tokenize(label) | _tokenize(definition)
+        overlap = len(q_tokens & n_tokens)
+        # 한국어 조사 대응: 라벨이 질문 문자열에 부분 포함되면 강한 매칭 (예: "이차방정식을")
+        if label and label in question:
+            overlap += 10
+        else:
+            for t in n_tokens:
+                if len(t) >= 2 and any(qt.startswith(t) or t.startswith(qt) for qt in q_tokens):
+                    overlap += 1
+        if overlap:
+            scored.append({"id": node_id, "label": label, "definition": definition,
+                            "score": overlap, "source": "buffer"})
+    scored.sort(key=lambda r: r["score"], reverse=True)
+    return scored[:limit]
+
+
+# ----------------------- OpenAI 임베딩 -----------------------
+def _embed_texts(texts: list[str]) -> list[list[float]] | None:
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        return None
+    from openai import OpenAI  # lazy import
+    model = os.environ.get("OPENAI_EMBED_MODEL", "text-embedding-3-large")
+    client = OpenAI(api_key=key)
+    resp = client.embeddings.create(model=model, input=texts)
+    return [d.embedding for d in resp.data]
+
+
+# ======================= TOOLS =======================
+@mcp.tool()
+def ontology_manifest() -> dict:
+    """그래프 온톨로지 그래머(공간·노드타입·관계·스키마팩 목록)를 반환한다."""
+    return MANIFEST
+
+
+@mcp.tool()
+def schema_pack_list(pack: str = DEFAULT_PACK) -> dict:
+    """설치 가능한 스키마팩 목록과 현재 팩(pack)에 설치된 상태를 함께 보여준다."""
+    installed = _get_pack(pack)["schema_packs"]
+    return {
+        "available": list(MANIFEST["schema_packs"].keys()),
+        "installed": installed,
+        "types_by_pack": MANIFEST["schema_packs"],
+    }
+
+
+@mcp.tool()
+def schema_pack_install(name: str, pack: str = DEFAULT_PACK) -> dict:
+    """스키마팩(saas/biomedical/legal 등)을 현재 팩 버퍼에 설치해 노드 타입을 늘린다."""
+    if name not in MANIFEST["schema_packs"]:
+        return {"error": f"알 수 없는 스키마팩: {name}. 사용 가능: {list(MANIFEST['schema_packs'])}"}
+    buf = _get_pack(pack)
+    if name not in buf["schema_packs"]:
+        buf["schema_packs"].append(name)
+    return {"installed": name, "node_types": MANIFEST["schema_packs"][name]}
+
+
+@mcp.tool()
+def ontology_add_node(space: str, node_type: str, node_id: str,
+                       properties: dict | None = None, pack: str = DEFAULT_PACK) -> dict:
+    """노드 하나를 현재 팩의 인메모리 버퍼에만 추가한다 (외부 DB 쓰기 없음)."""
+    if space not in MANIFEST["spaces"]:
+        return {"error": f"알 수 없는 space: {space}. 사용 가능: {list(MANIFEST['spaces'])}"}
+    node_data = {"space": space, "node_type": node_type, "properties": properties or {}}
+    _get_pack(pack)["nodes"][node_id] = node_data
+    return {"stores": {"buffer": "ok"}, "node_data": {node_id: node_data}}
+
+
+@mcp.tool()
+def ontology_add_edge(from_space: str, from_id: str, relation: str, to_space: str,
+                       to_id: str, properties: dict | None = None,
+                       pack: str = DEFAULT_PACK) -> dict:
+    """엣지 하나를 현재 팩의 인메모리 버퍼에만 추가한다. 정의된 관계인지 그래머로 검증한다."""
+    allowed = _allowed_relations(from_space, to_space)
+    if allowed is not None and relation not in allowed:
+        return {"error": f"'{from_space}'→'{to_space}' 간 허용되지 않은 관계: {relation}. "
+                          f"허용된 관계: {allowed}"}
+    edge = {"from_space": from_space, "from_id": from_id, "relation": relation,
+            "to_space": to_space, "to_id": to_id, "properties": properties or {}}
+    _get_pack(pack)["edges"].append(edge)
+    return {"stores": {"buffer": "ok"}, "edge": edge}
+
+
+@mcp.tool()
+def ontology_ingest(text: str, source_id: str | None = None, pack: str = DEFAULT_PACK) -> dict:
+    """텍스트를 evidence 공간의 TextUnit 노드 하나로 버퍼에 저장한다 (단순 분할, DB 쓰기 없음)."""
+    node_id = source_id or f"text:{secrets.token_hex(4)}"
+    node_data = {"space": "evidence", "node_type": "TextUnit",
+                 "properties": {"text": text, "label": node_id}}
+    _get_pack(pack)["nodes"][node_id] = node_data
+    return {"stores": {"buffer": "ok"}, "node_data": {node_id: node_data}}
+
+
+@mcp.tool()
+def query_bm25(question: str, limit: int = 5) -> dict:
+    """버퍼(토큰 겹침) + Neo4j 읽기전용 fulltext(있으면)를 합쳐 질문과 관련된 노드를 찾는다."""
+    buffer_hits = _buffer_search(DEFAULT_PACK, question, limit)
+    cloud_hits = _cloud_search(question, limit)
+    return {"results": (buffer_hits + cloud_hits)[:limit]}
+
+
+@mcp.tool()
+def ontology_query(question: str, limit: int = 5, pack: str = DEFAULT_PACK) -> dict:
+    """query_bm25 결과에 더해, 상위 버퍼 노드의 1-hop 엣지(graph_context)를 같이 반환한다."""
+    buffer_hits = _buffer_search(pack, question, limit)
+    cloud_hits = _cloud_search(question, limit)
+    graph_context = []
+    top_ids = {h["id"] for h in buffer_hits}
+    for edge in _get_pack(pack)["edges"]:
+        if edge["from_id"] in top_ids or edge["to_id"] in top_ids:
+            graph_context.append({"from": edge["from_id"], "rel": edge["relation"],
+                                   "to": edge["to_id"]})
+    return {"results": (buffer_hits + cloud_hits)[:limit], "graph_context": graph_context}
+
+
+@mcp.tool()
+def pack_ask(question: str, pack: str = DEFAULT_PACK) -> dict:
+    """질문에 가장 잘 맞는 버퍼 노드를 찾고 prerequisite_of/related_to 엣지를 최대 3홉 따라간다."""
+    buffer_hits = _buffer_search(pack, question, 1)
+    if not buffer_hits:
+        cloud_hits = _cloud_search(question, 5)
+        return {"matched": None, "chain": [], "explanation": "버퍼에 일치하는 노드가 없습니다.",
+                "참고(cloud)": cloud_hits}
+    matched = buffer_hits[0]
+    edges = _get_pack(pack)["edges"]
+    chain = []
+    current = matched["id"]
+    visited = {current}
+    for _ in range(3):
+        step = None
+        for e in edges:
+            if e["relation"] not in ("prerequisite_of", "related_to"):
+                continue
+            other = e["to_id"] if e["from_id"] == current else (e["from_id"] if e["to_id"] == current else None)
+            if other and other not in visited:
+                step = (e, other)
+                break
+        if not step:
+            break
+        e, other = step
+        chain.append({"from": e["from_id"], "rel": e["relation"], "to": e["to_id"]})
+        visited.add(other)
+        current = other
+
+    def _label(nid: str) -> str:
+        n = _get_pack(pack)["nodes"].get(nid)
+        return n.get("properties", {}).get("label", nid) if n else nid
+
+    explanation = _label(matched["id"])
+    prev = matched["id"]
+    for c in chain:
+        next_id = c["to"] if c["from"] == prev else c["from"]
+        explanation += f" → (선수) → {_label(next_id)}"
+        prev = next_id
+    cloud_hits = _cloud_search(question, 3)
+    return {"matched": matched, "chain": chain, "explanation": explanation, "참고(cloud)": cloud_hits}
+
+
+@mcp.tool()
+def pack_list() -> dict:
+    """현재 세션의 팩 이름과 노드/엣지 개수를 나열한다."""
+    return {
+        name: {"nodes": len(p["nodes"]), "edges": len(p["edges"]),
+               "schema_packs": p["schema_packs"]}
+        for name, p in PACKS.items()
+    }
+
+
+@mcp.tool()
+def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True) -> dict:
+    """현재 팩 버퍼를 zip(pack.json + 노드별 md + embeddings.json)으로 만들어 다운로드 링크를 준다."""
+    buf = _get_pack(pack)
+    files: dict[str, str] = {}
+    files["pack.json"] = json.dumps({
+        "nodes": buf["nodes"], "edges": buf["edges"],
+        "schema_packs": buf["schema_packs"], "manifest_version": MANIFEST["version"],
+    }, ensure_ascii=False, indent=2)
+
+    for node_id, node in buf["nodes"].items():
+        props = node.get("properties", {})
+        label = props.get("label", node_id)
+        definition = props.get("definition", props.get("text", ""))
+        md = (f"---\nid: {node_id}\nspace: {node['space']}\ntype: {node['node_type']}\n---\n"
+              f"# {label}\n\n{definition}\n")
+        files[f"{_safe_filename(label)}.md"] = md
+
+    embeddings_status = "skipped(no key)"
+    if include_embeddings:
+        labels = [n.get("properties", {}).get("label", nid) + " " +
+                  n.get("properties", {}).get("definition", "")
+                  for nid, n in buf["nodes"].items()]
+        node_ids = list(buf["nodes"].keys())
+        if labels:
+            vectors = _embed_texts(labels)
+            if vectors is not None:
+                files["embeddings.json"] = json.dumps(
+                    dict(zip(node_ids, vectors)), ensure_ascii=False
+                )
+                embeddings_status = "included"
+    else:
+        embeddings_status = "skipped(disabled)"
+
+    token = _store_zip(files)
+    base = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+    public_base = f"https://{base}" if base else "http://localhost:8000"
+    return {
+        "download_url": f"{public_base}/download/{token}",
+        "counts": {"nodes": len(buf["nodes"]), "edges": len(buf["edges"])},
+        "embeddings": embeddings_status,
+    }
+
+
+def build_app():
+    # /mcp = streamable HTTP (신형 클라이언트), /sse+/messages = legacy SSE
+    app = mcp.streamable_http_app()
+    app.router.routes.extend(mcp.sse_app().router.routes)
+    try:
+        from starlette.routing import Route
+        from starlette.responses import Response
+
+        async def download(request):
+            data = _BUNDLES.get(request.path_params["token"])
+            if not data:
+                return Response("링크가 만료되었습니다. pack_save를 다시 호출하세요.", status_code=404)
+            return Response(data, media_type="application/zip",
+                            headers={"Content-Disposition": 'attachment; filename="yupack.zip"'})
+        app.router.routes.append(Route("/download/{token}", download))
+    except Exception:
+        pass
+    return app
+
+
+app = build_app()
+
+
+def main():
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
+
+if __name__ == "__main__":
+    main()
