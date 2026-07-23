@@ -388,8 +388,18 @@ class LocalPack:
             if h["cosine"] >= 0.76:
                 score[h["id"]] = score.get(h["id"], 0) + (8 - i) + 2
         ranked = sorted(score.items(), key=lambda kv: -kv[1])
-        vector_gate_fail = bool(self.vec_meta) and vec and vec[0]["cosine"] < 0.76
-        if not ranked or vector_gate_fail or (not lex and not vec):
+        # 근거 게이트: 벡터(>=0.76) 또는 강한 어휘 일치(4자+ 토큰 정확 일치 / 2토큰 교집합)
+        q_toks = {t for t in re.findall(r"[\w가-힣]+", question) if len(t) >= 2}
+        lex_strong = False
+        for h in lex:
+            c = self.card(h["id"]) or {}
+            body = " ".join(str(v) for v in c.values() if isinstance(v, str))
+            inter = q_toks & {t for t in re.findall(r"[\w가-힣]+", body) if len(t) >= 2}
+            if len(inter) >= 2 or any(len(t) >= 4 for t in inter):
+                lex_strong = True
+                break
+        vec_strong = bool(vec) and vec[0]["cosine"] >= 0.76
+        if not ranked or not (vec_strong or lex_strong):
             self._audit("ask", f"no_local_evidence: {question[:80]}")
             return {"status": "no_local_evidence", "local_pack_id": self.pack_id,
                     "manifest_hash": self.manifest_hash,
