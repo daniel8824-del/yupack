@@ -292,6 +292,10 @@ def ontology_query(question: str, limit: int = 5, pack: str = DEFAULT_PACK) -> d
 def pack_ask(question: str, pack: str = DEFAULT_PACK) -> dict:
     """질문에 가장 잘 맞는 버퍼 노드를 찾고 그래프 엣지를 최대 3홉 따라가며 근거 사슬을 만든다."""
     buffer_hits = _buffer_search(pack, question, 1)
+    # 근거 부족 게이트: 약한 토큰 겹침(전방일치 잡음)만으로는 매칭으로 치지 않는다
+    if buffer_hits and buffer_hits[0]["score"] < 4:
+        return {"matched": None, "chain": [], "status": "no_grounded_match",
+                "explanation": "팩에 이 질문을 뒷받침할 근거가 없습니다. 팩 밖 지식으로 답하지 마세요."}
     if not buffer_hits:
         cloud_hits = _cloud_search(question, 5)
         return {"matched": None, "chain": [], "explanation": "버퍼에 일치하는 노드가 없습니다.",

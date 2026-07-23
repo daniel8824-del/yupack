@@ -1,7 +1,7 @@
 {
   "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"U=https://yupack-production.up.railway.app/mcp\\ncall() { # $1=id $2=body → 세션 유지 위해 헤더 파일 사용\\n  curl -s -D /tmp/yp-h.txt -X POST \\\"$U\\\" -H 'Content-Type: application/json' -H 'Accept: appl...",
-  "error": "Exit code 11\nSID=fef77f178389449594cbb6a0aac3ff56\n\"stores\\\": {\\n    \\\"buffer\\\": \\\"ok\\\"\\n  }\nhttps://yupack-production.up.railway.app/download/yCIOz3kLs8w\nArchive:  /tmp/yp-pack.zip\n  Length      Date    Time    Name\n---------  ---------- -----   ----\n      278  07-23-2026 02:52   pack.json\n       89  07-23-2026 02:52   �??�??�??�?��?�.md\n---------                     -------\n      367                     2 files\ncaution: filename not matched:  pack.yaml",
-  "timestamp": "2026-07-23T02:52:37.338Z",
+  "tool_input_preview": "{\"command\":\"tail -1 /private/tmp/claude-501/-Users-yedulab/45d3e8c8-fda0-4f4b-9097-ae93e2de2b5e/tasks/bxa0qtu3h.output\\nZ=/Users/yedulab/Zettelkasten/30_Claude/05_Research/llm-agent-research-canonical...",
+  "error": "Exit code 143\nCommand timed out after 2m 0s",
+  "timestamp": "2026-07-23T05:34:57.166Z",
   "retry_count": 1
 }
