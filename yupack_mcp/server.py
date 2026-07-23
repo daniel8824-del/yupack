@@ -567,63 +567,74 @@ def pack_list() -> dict:
 
 @mcp.tool()
 def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True) -> dict:
-    """현재 팩을 정본 임포터 계약 zip(nodes.jsonl + edges.jsonl + pack.yaml)으로 만들어 다운로드 링크를 준다.
+    """현재 팩을 질의 가능 완성 zip으로 저장해 다운로드 링크를 준다.
 
-    노드별 md(notes/)와 embeddings.json은 부속으로 동봉한다.
+    구조(표준 계약): pack.yaml + nodes/edges/evidence/reviews.jsonl + query-docs/ +
+    embeddings.json + lexical-index/ + vector-index/ + graph-index/ +
+    query-contract.json + integrity.json (+ runtime/, notes/).
+    이 zip은 pack_open_local로 열어 바로 질의할 수 있다.
     """
+    import tempfile as _tf
+    from . import local_pack
     buf = _get_pack(pack)
-    files: dict[str, str] = {}
-
-    # 정본 계약: 임포터가 먹는 jsonl
-    files["nodes.jsonl"] = "\n".join(
-        json.dumps({"id": nid, "space": n["space"], "node_type": n["node_type"],
-                    "properties": n.get("properties", {})}, ensure_ascii=False)
-        for nid, n in buf["nodes"].items())
-    files["edges.jsonl"] = "\n".join(
-        json.dumps(e, ensure_ascii=False) for e in buf["edges"])
+    if not buf["nodes"]:
+        return {"error": f"팩이 비어 있습니다: {pack}"}
     today = datetime.date.today().isoformat()
-    files["pack.yaml"] = (
-        f"pack_id: {_safe_filename(pack)}-{today}\n"
-        f"title: \"{pack}\"\n"
-        f"version: 1.0.0\n"
-        f"created: {today}\n"
-        f"manifest_version: \"{MANIFEST['version']}\"\n"
-        f"schema_packs: {json.dumps(buf['schema_packs'], ensure_ascii=False)}\n"
-        f"counts:\n  nodes: {len(buf['nodes'])}\n  edges: {len(buf['edges'])}\n"
-        f"storage: \"yupack local (sqlite/buffer), production DB 미접촉\"\n")
 
-    for node_id, node in buf["nodes"].items():
-        props = node.get("properties", {})
-        label = props.get("label", node_id)
-        definition = props.get("definition", props.get("text", ""))
-        md = (f"---\nid: {node_id}\nspace: {node['space']}\ntype: {node['node_type']}\n---\n"
-              f"# {label}\n\n{definition}\n")
-        files[f"notes/{_safe_filename(label)}.md"] = md
+    # 1) 버퍼 -> 정본 5파일 (evidence 노드는 evidence.jsonl로도 승격)
+    nodes_l, evidence_l = [], []
+    for nid, n in buf["nodes"].items():
+        props = n.get("properties", {})
+        nodes_l.append(json.dumps({"id": nid, "space": n["space"],
+                                    "node_type": n["node_type"], "label": props.get("label"),
+                                    "properties": props}, ensure_ascii=False))
+        if n["space"] == "evidence":
+            evidence_l.append(json.dumps({
+                "evidence_id": nid,
+                "summary": props.get("text") or props.get("definition") or props.get("label"),
+                "conditions": props.get("conditions"), "limitations": props.get("limitations"),
+                "evidence_grade": props.get("evidence_grade"),
+                "source_id": props.get("source_id"), "source_locator": props.get("source_locator"),
+            }, ensure_ascii=False))
+    edges_l = [json.dumps({"source": e["from_id"], "target": e["to_id"],
+                            "relation": e["relation"], "properties": e.get("properties", {})},
+                           ensure_ascii=False) for e in buf["edges"]]
+    pack_yaml = (f"schema: yucrates.ontology.v1.2\npack_id: {_safe_filename(pack)}-{today}\n"
+                 f"title: \"{pack}\"\nversion: 1.0.0\ncreated: {today}\n"
+                 f"manifest_version: \"{MANIFEST['version']}\"\n"
+                 f"schema_packs: {json.dumps(buf['schema_packs'], ensure_ascii=False)}\n"
+                 f"storage: \"local zip only, production DB 미접촉\"\n")
 
-    embeddings_status = "skipped(no key)"
-    if include_embeddings:
-        labels = [n.get("properties", {}).get("label", nid) + " " +
-                  n.get("properties", {}).get("definition", "")
-                  for nid, n in buf["nodes"].items()]
-        node_ids = list(buf["nodes"].keys())
-        if labels:
-            vectors = _embed_texts(labels)
-            if vectors is not None:
-                files["embeddings.json"] = json.dumps(
-                    dict(zip(node_ids, vectors)), ensure_ascii=False
-                )
-                embeddings_status = "included"
-    else:
-        embeddings_status = "skipped(disabled)"
+    with _tf.TemporaryDirectory() as td:
+        src = os.path.join(td, "canonical.zip")
+        with zipfile.ZipFile(src, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("pack.yaml", pack_yaml)
+            z.writestr("nodes.jsonl", "\n".join(nodes_l))
+            z.writestr("edges.jsonl", "\n".join(edges_l))
+            z.writestr("evidence.jsonl", "\n".join(evidence_l))
+            z.writestr("reviews.jsonl", "")
+        out = os.path.join(td, "pack-queryable.zip")
+        # 2) 같은 표준 파이프라인으로 질의 가능 zip 생성
+        r = local_pack.build_queryable(src, out, include_embeddings)
+        if "error" in r:
+            return r
+        # 3) notes/ md 부속 추가 (옵시디언용)
+        with zipfile.ZipFile(out, "a", zipfile.ZIP_DEFLATED) as z:
+            for nid, n in buf["nodes"].items():
+                props = n.get("properties", {})
+                label = props.get("label", nid)
+                z.writestr(f"notes/{_safe_filename(label)}.md",
+                           f"---\nid: {nid}\nspace: {n['space']}\ntype: {n['node_type']}\n---\n"
+                           f"# {label}\n\n{props.get('definition', props.get('text', ''))}\n")
+        data = open(out, "rb").read()
 
-    token = _store_zip(files)
+    tok = secrets.token_urlsafe(8)
+    _BUNDLES[tok] = data
     base = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
     public_base = f"https://{base}" if base else "http://localhost:8000"
-    return {
-        "download_url": f"{public_base}/download/{token}",
-        "counts": {"nodes": len(buf["nodes"]), "edges": len(buf["edges"])},
-        "embeddings": embeddings_status,
-    }
+    return {"download_url": f"{public_base}/download/{tok}",
+            "structure": r["files"] if isinstance(r.get("files"), list) else None,
+            "counts": r["counts"], "embeddings": r["embeddings"]}
 
 
 from . import governance as _governance

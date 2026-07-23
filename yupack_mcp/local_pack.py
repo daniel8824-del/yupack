@@ -111,7 +111,7 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
         rel = e.get("relation", "related_to")
         adj.setdefault(s, []).append([rel, t])
         adj.setdefault(t, []).append([f"~{rel}", s])
-    files["indexes/graph-adjacency.jsonl"] = "\n".join(
+    files["graph-index/adjacency.jsonl"] = "\n".join(
         json.dumps({"id": k, "edges": v}, ensure_ascii=False) for k, v in adj.items()).encode()
 
     # lexical FTS5
@@ -132,7 +132,7 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
         rows.append((ev["evidence_id"], "evidence", body))
     con.executemany("INSERT INTO docs VALUES(?,?,?)", rows)
     con.commit(); con.close()
-    files["indexes/lexical.sqlite"] = open(tmp.name, "rb").read()
+    files["lexical-index/fts.sqlite"] = open(tmp.name, "rb").read()
     os.unlink(tmp.name)
 
     # vectors (로컬 bge-m3)
@@ -160,12 +160,48 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
                                   "text_sha256": _sha256(text.encode())})
                 vec_buf.write(struct.pack(f"{EMBED_DIM}f", *v))
         if ok and emb_meta:
-            files["indexes/vectors.bin"] = vec_buf.getvalue()
-            files["indexes/vector-metadata.jsonl"] = "\n".join(
+            files["vector-index/vectors.bin"] = vec_buf.getvalue()
+            files["vector-index/vector-metadata.jsonl"] = "\n".join(
                 json.dumps(m) for m in emb_meta).encode()
             emb_status = f"included({len(emb_meta)} x {EMBED_DIM}, {EMBED_MODEL}, normalized)"
         else:
             emb_status = "unavailable(로컬 임베딩 서버 미가동): lexical+graph로 동작"
+
+    # query-docs/: 레버·결정경로·정책 근거 카드 (조건·한계·검수 상태 원문 그대로)
+    review_by_target = {}
+    for r in reviews:
+        review_by_target.setdefault(r.get("target_id"), []).append(
+            {"status": r.get("review_status"), "reviewer_role": r.get("reviewer_role")})
+    ev_by_id = {e["evidence_id"]: e for e in evidence}
+    # 근거가 supports로 연결된 노드도 카드 대상 (일반 사용자 팩: 개념+근거 구조)
+    supported = set()
+    for e in edges:
+        if e.get("relation") in ("supports", "describes", "mentions", "exemplifies"):
+            supported.add(e.get("target") or e.get("to_id"))
+    n_cards = 0
+    for n in nodes:
+        is_core = n.get("space") in ("lever", "outcome", "policy") or str(n.get("id","")).startswith("path:")
+        if not is_core and n.get("id") not in supported:
+            continue
+        p = n.get("properties", {})
+        refs = list(p.get("evidence_refs") or [])
+        for e in edges:
+            if e.get("relation") in ("supports", "describes", "mentions", "exemplifies") \
+                    and (e.get("target") or e.get("to_id")) == n["id"]:
+                src_ev = e.get("source") or e.get("from_id")
+                if src_ev in ev_by_id and src_ev not in refs:
+                    refs.append(src_ev)
+        card = {"id": n["id"], "space": n.get("space"),
+                "label": n.get("label") or p.get("label"), "properties": p,
+                "review_status": review_by_target.get(n["id"], []),
+                "evidence_cards": [
+                    {k: ev_by_id[e].get(k) for k in ("evidence_id", "summary", "conditions",
+                     "limitations", "evidence_grade", "source_id", "source_locator")}
+                    for e in refs if e in ev_by_id],
+                "governance": "local_validation_required" if n.get("space") == "lever" else "informational"}
+        fn = re.sub(r"[^\w가-힣.-]+", "_", n["id"])
+        files[f"query-docs/{fn}.json"] = json.dumps(card, ensure_ascii=False, indent=1).encode()
+        n_cards += 1
 
     # runtime: ontology.sqlite(overlay/audit) + policy.yaml
     tmp2 = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
@@ -215,6 +251,30 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
                 "sha256": {k: _sha256(v) for k, v in files.items()}}
     files["runtime/manifest.lock"] = json.dumps(manifest, ensure_ascii=False, indent=1).encode()
 
+    files["embeddings.json"] = json.dumps({
+        "model": EMBED_MODEL if emb_meta else None, "dim": EMBED_DIM if emb_meta else None,
+        "normalized": True, "count": len(emb_meta),
+        "storage": "vector-index/vectors.bin (float32 row-major)",
+        "per_row_text_sha256": "vector-index/vector-metadata.jsonl",
+        "corpus_sha256": _sha256(b"".join(m["text_sha256"].encode() for m in emb_meta)) if emb_meta else None,
+        "query_runtime": "로컬 OMLX bge-m3(127.0.0.1:8000), 미가동 시 lexical+graph 폴백",
+    }, ensure_ascii=False, indent=1).encode()
+    files["query-contract.json"] = json.dumps({
+        "discovery_layer": "search_only",
+        "decision_core": "local_validation_required",
+        "no_cloud_fallback": True,
+        "no_pack_side_prescription": "팩은 근거 카드만 반환한다. 자연어 답변은 호출측 책임.",
+        "no_grounded_match_policy": "근거 없으면 no_local_evidence를 반환하고 팩 밖 지식으로 답하지 않는다.",
+        "answer_requirements": ["matched_levers", "claims", "direct_evidence", "sources",
+                                  "conditions", "limitations", "review_status",
+                                  "retrieval_trace", "local_pack_id", "manifest_hash"],
+    }, ensure_ascii=False, indent=1).encode()
+    files["integrity.json"] = json.dumps({
+        "counts": {"nodes": len(nodes), "edges": len(edges), "evidence": len(evidence),
+                    "reviews": len(reviews), "query_docs": n_cards, "embedded": len(emb_meta)},
+        "sha256": {k: _sha256(v) for k, v in sorted(files.items())},
+    }, ensure_ascii=False, indent=1).encode()
+
     out_zip = out_zip or os.path.join(
         os.path.dirname(source_zip),
         os.path.basename(source_zip).replace(".zip", "") + "-queryable.zip")
@@ -249,8 +309,18 @@ class LocalPack:
         self.root = root
         # 무결성 검증 (manifest.lock 있으면)
         self.integrity = "no_manifest"
+        integ = os.path.join(root, "integrity.json")
+        if os.path.exists(integ):
+            m = json.load(open(integ, encoding="utf-8"))
+            bad = [rel for rel, want in m["sha256"].items()
+                   if rel != "runtime/ontology.sqlite" and
+                   (not os.path.exists(os.path.join(root, rel)) or
+                    _sha256(open(os.path.join(root, rel), "rb").read()) != want)]
+            self.integrity = "ok" if not bad else f"failed:{bad[:5]}"
         lock = os.path.join(root, "runtime", "manifest.lock")
-        if os.path.exists(lock):
+        if self.integrity != "no_manifest":
+            lock = ""  # integrity.json이 권위
+        if lock and os.path.exists(lock):
             m = json.load(open(lock, encoding="utf-8"))
             bad = []
             for rel, want in m["sha256"].items():
@@ -270,16 +340,19 @@ class LocalPack:
             self.reviews.setdefault(r["target_id"], []).append(
                 {"status": r.get("review_status"), "reviewer_role": r.get("reviewer_role")})
         self.adj: dict[str, list] = {}
-        adj_p = os.path.join(root, "indexes", "graph-adjacency.jsonl")
+        adj_p = os.path.join(root, "graph-index", "adjacency.jsonl")
+        if not os.path.exists(adj_p):
+            adj_p = os.path.join(root, "indexes", "graph-adjacency.jsonl")
         if os.path.exists(adj_p):
             for l in open(adj_p, encoding="utf-8"):
                 d = json.loads(l)
                 self.adj[d["id"]] = d["edges"]
         self.vec_meta, self.vecs = [], b""
-        vm = os.path.join(root, "indexes", "vector-metadata.jsonl")
+        vdir = "vector-index" if os.path.exists(os.path.join(root, "vector-index")) else "indexes"
+        vm = os.path.join(root, vdir, "vector-metadata.jsonl")
         if os.path.exists(vm):
             self.vec_meta = [json.loads(l) for l in open(vm)]
-            self.vecs = open(os.path.join(root, "indexes", "vectors.bin"), "rb").read()
+            self.vecs = open(os.path.join(root, vdir, "vectors.bin"), "rb").read()
         self._audit("open", f"mode={mode}")
 
     def _read(self, name: str) -> str:
@@ -306,7 +379,9 @@ class LocalPack:
 
     # --- retrieval 3종 ---
     def lexical(self, q: str, k: int = 8) -> list[dict]:
-        p = os.path.join(self.root, "indexes", "lexical.sqlite")
+        p = os.path.join(self.root, "lexical-index", "fts.sqlite")
+        if not os.path.exists(p):
+            p = os.path.join(self.root, "indexes", "lexical.sqlite")
         if not os.path.exists(p):
             return []
         toks = [t for t in re.findall(r"[\w가-힣]+", q) if len(t) >= 2]
@@ -372,9 +447,15 @@ class LocalPack:
                      "validation_probe", "evidence_refs", "measurement", "rule"):
             if p.get(key):
                 out[key] = p[key]
+        refs = list(p.get("evidence_refs") or [])
+        # 인접 evidence(describes/mentions/exemplifies/supports 역방향)도 근거로 수집
+        for rel, other in self.adj.get(nid, []):
+            if rel.lstrip("~") in ("supports", "describes", "mentions", "exemplifies") \
+                    and other in self.evidence and other not in refs:
+                refs.append(other)
         if n.get("space") == "lever":
             out["governance"] = "local_validation_required"
-            refs = p.get("evidence_refs") or []
+        if refs:
             out["direct_evidence"] = [self.card(e) for e in refs if e in self.evidence][:4]
         return out
 
