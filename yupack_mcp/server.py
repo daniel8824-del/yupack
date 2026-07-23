@@ -925,12 +925,17 @@ def build_app():
     return app
 
 
-app = build_app()
-
-
 def main():
+    # 서버(Railway) 모드에서만 starlette/uvicorn 필요. 로컬 stdio는 이 경로를 안 탄다.
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    uvicorn.run(build_app(), host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
+
+# ASGI 서버(uvicorn yupack_mcp.server:app)용. starlette 없으면 None (로컬 stdio 무관).
+try:
+    app = build_app()
+except Exception:
+    app = None
 
 
 def local_main():
