@@ -644,26 +644,22 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
         result["status"] = "needs_save_path"
         result["ask_user"] = "압축파일(팩)을 어느 폴더에 저장할까요? 옵시디언 볼트의 팩 폴더 경로를 알려주세요."
         return result
-    dest_dir = save_to
-    if dest_dir:
-        dest_dir = os.path.expanduser(dest_dir)
-        if os.path.isdir(dest_dir) or not os.path.splitext(dest_dir)[1]:
-            os.makedirs(dest_dir, exist_ok=True)
-            dest = os.path.join(dest_dir, f"{_safe_filename(pack)}-{today}-queryable.zip")
-        else:
-            dest = dest_dir
-        with open(dest, "wb") as fh:
-            fh.write(data)
-        result["saved_to"] = dest
-        result["note"] = "팩 서재에 저장됨. 바로 질의 가능합니다."
-    if os.environ.get("RAILWAY_PUBLIC_DOMAIN"):
+    if is_server:
         tok = secrets.token_urlsafe(8)
         _BUNDLES[tok] = data
         result["download_url"] = f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN']}/download/{tok}"
-    elif "saved_to" not in result:
-        tok = secrets.token_urlsafe(8)
-        _BUNDLES[tok] = data
-        result["download_url"] = f"http://localhost:8000/download/{tok}"
+        result["note"] = "서버 모드: 다운로드 후 로컬 팩 폴더로 옮기세요."
+        return result
+    # 로컬: 사용자가 준 경로 아래에 팩별 폴더를 유팩이 만들어 저장
+    base = os.path.expanduser(save_to)
+    pack_dir = os.path.join(base, f"{_safe_filename(pack)}-{today}")
+    os.makedirs(pack_dir, exist_ok=True)
+    dest = os.path.join(pack_dir, "pack.zip")
+    with open(dest, "wb") as fh:
+        fh.write(data)
+    result["saved_to"] = dest
+    result["pack_folder"] = pack_dir
+    result["note"] = f"'{pack}' 팩 폴더를 만들어 저장했습니다. pack_open_local(\"{dest}\")로 바로 질의할 수 있습니다."
     return result
 
 
