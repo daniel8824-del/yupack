@@ -90,7 +90,7 @@ def _allowed_relations(from_space: str | None, to_space: str | None) -> list[str
     return None
 
 
-def _store_zip(files: dict[str, str]) -> str:
+def _store_zip(files: dict) -> str:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for name, content in files.items():
@@ -441,9 +441,14 @@ def _import_pack_zip(data: bytes, pack: str) -> dict:
         return min(cands, key=len) if cands else None
 
     nodes_f, edges_f = _find("nodes.jsonl"), _find("edges.jsonl")
+    extras = {}
+    for name in ("evidence.jsonl", "reviews.jsonl", "pack.yaml"):
+        fn = _find(name)
+        if fn:
+            extras[name] = z.read(fn).decode("utf-8")
     if not nodes_f:
         return {"error": f"zip 안에 nodes.jsonl이 없습니다. 파일 목록: {names[:10]}"}
-    buf = {"nodes": {}, "edges": [], "schema_packs": []}
+    buf = {"nodes": {}, "edges": [], "schema_packs": [], "extras": extras}
     for line in z.read(nodes_f).decode("utf-8").splitlines():
         if not line.strip():
             continue
@@ -492,6 +497,59 @@ def pack_import(source: str, pack: str = "정본팩") -> dict:
         return _import_pack_zip(data, pack)
     except Exception as e:
         return {"error": f"가져오기 실패: {e}"}
+
+
+@mcp.tool()
+def pack_build_queryable(source_zip: str, out_zip: str | None = None,
+                          include_embeddings: bool = True) -> dict:
+    """정본 zip을 self-contained 질의 가능 zip(indexes/ + runtime/ + reports/ 동봉)으로 재구성한다."""
+    from . import local_pack
+    return local_pack.build_queryable(source_zip, out_zip, include_embeddings)
+
+
+@mcp.tool()
+def pack_open_local(zip_path: str, mode: str = "read_only") -> dict:
+    """로컬 zip 팩을 열고 manifest.lock으로 무결성을 검증한다. pack_handle을 반환한다."""
+    from . import local_pack
+    try:
+        return local_pack.open_local(zip_path, mode)
+    except Exception as e:
+        return {"error": f"열기 실패: {e}"}
+
+
+@mcp.tool()
+def pack_status(pack_handle: str) -> dict:
+    """열린 로컬 팩의 무결성·카운트·모드를 반환한다."""
+    from . import local_pack
+    pk = local_pack.get(pack_handle)
+    return pk.status() if pk else {"error": f"핸들 없음: {pack_handle}"}
+
+
+@mcp.tool()
+def pack_ask_local(pack_handle: str, question: str, top_k: int = 6) -> dict:
+    """열린 로컬 팩에 질의한다. lexical+vector+graph 3중 검색, 근거 카드와
+    retrieval_trace를 반환하며 근거가 없으면 no_local_evidence를 반환한다."""
+    from . import local_pack
+    pk = local_pack.get(pack_handle)
+    if not pk:
+        return {"error": f"핸들 없음: {pack_handle}. 먼저 pack_open_local을 호출하세요."}
+    return pk.ask(question, top_k)
+
+
+@mcp.tool()
+def pack_close(pack_handle: str) -> dict:
+    """열린 로컬 팩 핸들을 닫는다."""
+    from . import local_pack
+    return local_pack.close(pack_handle)
+
+
+@mcp.tool()
+def pack_create(pack: str) -> dict:
+    """새 팩 버퍼를 만든다 (이후 add_node/ingest/extract로 채우고 pack_save로 내보낸다)."""
+    if pack in PACKS:
+        return {"error": f"이미 존재: {pack}"}
+    _get_pack(pack)
+    return {"created": pack, "stores": {"buffer": "ok", "sqlite": _persist(pack)}}
 
 
 @mcp.tool()
@@ -565,6 +623,119 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True) -> dict
     }
 
 
+from . import governance as _governance
+
+
+@mcp.tool()
+def workflow_create_run(pack_handle: str, kind: str) -> dict:
+    """authoring 상태의 로컬 workflow run을 생성한다."""
+    return _governance.workflow_create_run(pack_handle, kind)
+
+
+@mcp.tool()
+def workflow_advance(pack_handle: str, run_id: str) -> dict:
+    """workflow를 authoring, validation, independent_review, promotion 순서로 한 단계 전진시킨다."""
+    return _governance.workflow_advance(pack_handle, run_id)
+
+
+@mcp.tool()
+def approval_request(pack_handle: str, target: str, reason: str) -> dict:
+    """승인 요청을 pending으로 기록하고 자동 승인하지 않는다."""
+    return _governance.approval_request(pack_handle, target, reason)
+
+
+@mcp.tool()
+def harness_promotion_apply(pack_handle: str, candidate_id: str) -> dict:
+    """promoted 상태의 후보만 로컬 overlay에 적용 표시한다."""
+    return _governance.harness_promotion_apply(pack_handle, candidate_id)
+
+
+@mcp.tool()
+def identity_add_alias(pack_handle: str, alias: str, canonical: str) -> dict:
+    """identity alias를 canonical id에 연결한다."""
+    return _governance.identity_add_alias(pack_handle, alias, canonical)
+
+
+@mcp.tool()
+def identity_resolve_canonical(pack_handle: str, identity: str) -> dict:
+    """alias 체인을 따라 identity의 canonical id를 반환한다."""
+    return _governance.identity_resolve_canonical(pack_handle, identity)
+
+
+@mcp.tool()
+def identity_propose_duplicate(pack_handle: str, a: str, b: str) -> dict:
+    """두 identity를 pending duplicate 후보로 기록한다."""
+    return _governance.identity_propose_duplicate(pack_handle, a, b)
+
+
+@mcp.tool()
+def identity_resolve_duplicate(pack_handle: str, a: str, b: str,
+                               decision: str) -> dict:
+    """duplicate 후보를 merge 또는 distinct로 확정한다."""
+    return _governance.identity_resolve_duplicate(pack_handle, a, b, decision)
+
+
+@mcp.tool()
+def identity_list_pending_duplicates(pack_handle: str) -> dict:
+    """pending duplicate 후보를 나열한다."""
+    return _governance.identity_list_pending_duplicates(pack_handle)
+
+
+@mcp.tool()
+def canonicalize_merge_nodes(pack_handle: str, keep_id: str, drop_id: str) -> dict:
+    """원본을 수정하지 않고 두 노드의 merge overlay와 alias를 기록한다."""
+    return _governance.canonicalize_merge_nodes(pack_handle, keep_id, drop_id)
+
+
+@mcp.tool()
+def canonicalize_find_and_propose(pack_handle: str, threshold: float = 0.9) -> dict:
+    """label이 정확히 같은 노드쌍을 pending duplicate 후보로 제안한다."""
+    return _governance.canonicalize_find_and_propose(pack_handle, threshold)
+
+
+@mcp.tool()
+def promotion_register_candidate(pack_handle: str, node_id: str) -> dict:
+    """노드를 독립 검수 전 promotion 후보로 등록한다."""
+    return _governance.promotion_register_candidate(pack_handle, node_id)
+
+
+@mcp.tool()
+def promotion_validate_candidate(pack_handle: str, candidate_id: str) -> dict:
+    """promotion 후보의 로컬 evidence_refs를 검사하고 validation만 기록한다."""
+    return _governance.promotion_validate_candidate(pack_handle, candidate_id)
+
+
+@mcp.tool()
+def promotion_promote(pack_handle: str, candidate_id: str,
+                      independent_review: bool = False) -> dict:
+    """독립 검수를 명시한 promotion 후보만 promoted로 바꾼다."""
+    return _governance.promotion_promote(pack_handle, candidate_id, independent_review)
+
+
+@mcp.tool()
+def promotion_reject(pack_handle: str, candidate_id: str) -> dict:
+    """promotion 후보를 rejected 상태로 기록한다."""
+    return _governance.promotion_reject(pack_handle, candidate_id)
+
+
+@mcp.tool()
+def billing_get_usage(pack_handle: str) -> dict:
+    """로컬 zip, 캐시, 노드, 벡터, audit event 사용량을 반환한다."""
+    return _governance.billing_get_usage(pack_handle)
+
+
+@mcp.tool()
+def billing_list_events(pack_handle: str, limit: int = 50) -> dict:
+    """로컬 audit event를 최신순으로 반환한다."""
+    return _governance.billing_list_events(pack_handle, limit)
+
+
+@mcp.tool()
+def ontology_rebac_check(pack_handle: str, actor: str, action: str) -> dict:
+    """runtime/policy.yaml의 rebac 규칙으로 action 허용 여부를 확인한다."""
+    return _governance.ontology_rebac_check(pack_handle, actor, action)
+
+
 def build_app():
     # /mcp = streamable HTTP (신형 클라이언트), /sse+/messages = legacy SSE
     app = mcp.streamable_http_app()
@@ -604,6 +775,11 @@ app = build_app()
 def main():
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
+
+def local_main():
+    """로컬 stdio MCP (Codex/Claude 데스크톱용): codex mcp add yupack -- python3 -m yupack_mcp.local"""
+    mcp.run()
 
 
 if __name__ == "__main__":
