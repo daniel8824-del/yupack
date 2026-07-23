@@ -569,12 +569,18 @@ def pack_list() -> dict:
 @mcp.tool()
 def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
               save_to: str | None = None) -> dict:
-    """현재 팩을 질의 가능 완성 zip으로 저장해 다운로드 링크를 준다.
+    """현재 팩을 질의 가능 완성 zip으로 저장한다.
 
     구조(표준 계약): pack.yaml + nodes/edges/evidence/reviews.jsonl + query-docs/ +
     embeddings.json + lexical-index/ + vector-index/ + graph-index/ +
     query-contract.json + integrity.json (+ runtime/, notes/).
     이 zip은 pack_open_local로 열어 바로 질의할 수 있다.
+
+    save_to: 저장할 폴더/파일 경로. 볼트 위치는 사람마다 다르므로 임의로 정하지 말고
+      **저장 전에 반드시 사용자에게 "압축파일을 어느 폴더에 저장할까요? (옵시디언 볼트의
+      팩 폴더 경로)"라고 물어서** 받은 경로를 save_to로 넘겨라. save_to가 비어 있으면
+      이 도구는 저장하지 않고 경로를 물으라는 안내(needs_save_path)를 반환한다.
+      서버(챗지피티) 모드에서는 디스크에 못 쓰므로 다운로드 링크를 준다.
     """
     import tempfile as _tf
     from . import local_pack
@@ -632,8 +638,13 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
 
     result = {"structure": r["files"] if isinstance(r.get("files"), list) else None,
               "counts": r["counts"], "embeddings": r["embeddings"]}
-    # 로컬 모드: save_to 경로(생략 시 팩 서재 YUPACK_PACK_DIR)에 직접 저장
-    dest_dir = save_to or os.environ.get("YUPACK_PACK_DIR")
+    is_server = bool(os.environ.get("RAILWAY_PUBLIC_DOMAIN"))
+    # 로컬 모드에서 저장 경로 미지정 -> 저장하지 않고 사용자에게 경로를 묻게 한다
+    if not save_to and not is_server:
+        result["status"] = "needs_save_path"
+        result["ask_user"] = "압축파일(팩)을 어느 폴더에 저장할까요? 옵시디언 볼트의 팩 폴더 경로를 알려주세요."
+        return result
+    dest_dir = save_to
     if dest_dir:
         dest_dir = os.path.expanduser(dest_dir)
         if os.path.isdir(dest_dir) or not os.path.splitext(dest_dir)[1]:
