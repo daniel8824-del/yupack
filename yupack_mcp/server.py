@@ -548,6 +548,59 @@ def pack_close(pack_handle: str) -> dict:
 
 
 @mcp.tool()
+def pack_set_default(zip_path: str) -> dict:
+    """이 컴퓨터의 기본 팩을 지정한다 (Codex 등록의 YUPACK_AUTO_OPEN을 갱신).
+
+    이후 새 Codex 작업마다 이 팩이 자동으로 열려, 사용자는 pack_open_local 없이 바로 질문할 수 있다.
+    zip_path는 사용자가 자기 팩을 저장한 경로다. 모르면 사용자에게 물어라 (사람마다 다르다).
+    """
+    import tomllib
+    zip_path = os.path.expanduser(zip_path)
+    if not os.path.exists(zip_path):
+        return {"error": f"팩 파일이 없습니다: {zip_path}. 저장한 팩 zip 경로를 확인하세요."}
+    cfg = os.path.expanduser("~/.codex/config.toml")
+    if not os.path.exists(cfg):
+        return {"error": "~/.codex/config.toml이 없습니다. Codex CLI 설치 후 yupack MCP를 먼저 등록하세요."}
+    text = open(cfg, encoding="utf-8").read()
+    try:
+        data = tomllib.loads(text)
+    except Exception as e:
+        return {"error": f"config.toml 파싱 실패: {e}"}
+    srv = (data.get("mcp_servers") or {})
+    name = "yupack-local" if "yupack-local" in srv else ("yupack" if "yupack" in srv else None)
+    if not name:
+        return {"error": "config.toml에 yupack MCP 등록이 없습니다. 먼저 codex mcp add로 등록하세요."}
+    # [mcp_servers.<name>.env] 섹션의 YUPACK_AUTO_OPEN 라인을 갱신/추가 (다른 섹션 무손상)
+    lines = text.splitlines()
+    env_hdr = f"[mcp_servers.{name}.env]"
+    out, in_env, done = [], False, False
+    for ln in lines:
+        st = ln.strip()
+        if st.startswith("[") and st != env_hdr and in_env:
+            if not done:
+                out.append(f'YUPACK_AUTO_OPEN = "{zip_path}"')
+                out.append("")
+                done = True
+            in_env = False
+        if st == env_hdr:
+            in_env = True
+        if in_env and st.startswith("YUPACK_AUTO_OPEN"):
+            out.append(f'YUPACK_AUTO_OPEN = "{zip_path}"')
+            done = True
+            continue
+        out.append(ln)
+    if in_env and not done:
+        out.append(f'YUPACK_AUTO_OPEN = "{zip_path}"')
+        done = True
+    if not done:  # env 섹션 자체가 없으면 추가
+        out += ["", env_hdr, f'YUPACK_AUTO_OPEN = "{zip_path}"']
+    with open(cfg, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    return {"ok": True, "default_pack": zip_path, "server": name,
+            "note": "기본 팩 지정 완료. Codex를 재시작하면 이 팩이 자동으로 열려 바로 질문할 수 있습니다."}
+
+
+@mcp.tool()
 def pack_create(pack: str) -> dict:
     """새 팩 버퍼를 만든다 (이후 add_node/ingest/extract로 채우고 pack_save로 내보낸다)."""
     if pack in PACKS:
