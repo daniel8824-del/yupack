@@ -232,6 +232,100 @@ def schema_pack_install(name: str, pack: str = DEFAULT_PACK) -> dict:
 
 
 @mcp.tool()
+def schema_pack_uninstall(name: str, pack: str = DEFAULT_PACK) -> dict:
+    """현재 팩 버퍼에서 스키마팩을 제거한다 (노드는 남고, 타입 확장만 해제)."""
+    buf = _get_pack(pack)
+    if name not in buf["schema_packs"]:
+        return {"error": f"설치되어 있지 않음: {name}. 현재: {buf['schema_packs']}"}
+    buf["schema_packs"].remove(name)
+    return {"uninstalled": name, "remaining": buf["schema_packs"],
+            "stores": {"buffer": "ok", "sqlite": _persist(pack)}}
+
+
+@mcp.tool()
+def ontology_extract(text: str, pack: str = DEFAULT_PACK, max_nodes: int = 8) -> dict:
+    """텍스트에서 개념 노드와 관계를 LLM으로 추출해 팩 버퍼에 넣는다 (DB 쓰기 없음)."""
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        return {"error": "OPENAI_API_KEY 없음: extract는 LLM이 필요합니다."}
+    from openai import OpenAI
+    client = OpenAI(api_key=key)
+    model = os.environ.get("OPENAI_EXTRACT_MODEL", "gpt-4o-mini")
+    prompt = (f"다음 텍스트에서 핵심 개념 최대 {max_nodes}개와 개념 사이 관계를 추출해 JSON으로만 답하라. "
+              '형식: {"nodes":[{"id":"c:슬러그","label":"...","definition":"..."}],'
+              '"edges":[{"from":"c:슬러그","relation":"prerequisite_of|related_to|part_of","to":"c:슬러그"}]}'
+              f"\n\n텍스트:\n{text[:6000]}")
+    resp = client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}],
+                                          response_format={"type": "json_object"})
+    data = json.loads(resp.choices[0].message.content)
+    buf = _get_pack(pack)
+    added_n, added_e = 0, 0
+    for n in data.get("nodes", [])[:max_nodes]:
+        nid = n.get("id") or f"c:{secrets.token_hex(3)}"
+        buf["nodes"][nid] = {"space": "concept", "node_type": "Concept",
+                             "properties": {"label": n.get("label", nid),
+                                             "definition": n.get("definition", "")}}
+        added_n += 1
+    for e in data.get("edges", []):
+        if e.get("from") in buf["nodes"] and e.get("to") in buf["nodes"]:
+            buf["edges"].append({"from_space": "concept", "from_id": e["from"],
+                                  "relation": e.get("relation", "related_to"),
+                                  "to_space": "concept", "to_id": e["to"], "properties": {}})
+            added_e += 1
+    return {"added": {"nodes": added_n, "edges": added_e},
+            "stores": {"buffer": "ok", "sqlite": _persist(pack)}}
+
+
+@mcp.tool()
+def ontology_impact(node_id: str, pack: str = DEFAULT_PACK, depth: int = 2) -> dict:
+    """노드를 바꾸면 영향이 미치는 반경을 BFS로 계산한다 (홉별 이웃 노드)."""
+    buf = _get_pack(pack)
+    if node_id not in buf["nodes"]:
+        return {"error": f"노드 없음: {node_id}"}
+    frontier, visited = {node_id}, {node_id}
+    rings = []
+    for _ in range(max(1, min(depth, 4))):
+        nxt = set()
+        for e in buf["edges"]:
+            if e["from_id"] in frontier and e["to_id"] not in visited:
+                nxt.add(e["to_id"])
+            elif e["to_id"] in frontier and e["from_id"] not in visited:
+                nxt.add(e["from_id"])
+        if not nxt:
+            break
+        rings.append(sorted(nxt)[:50])
+        visited |= nxt
+        frontier = nxt
+    def _lab(nid):
+        n = buf["nodes"].get(nid)
+        return n.get("properties", {}).get("label", nid) if n else nid
+    return {"node": node_id, "impact_total": len(visited) - 1,
+            "rings": [[{"id": i, "label": _lab(i)} for i in ring] for ring in rings]}
+
+
+@mcp.tool()
+def ontology_lever_simulate(lever_id: str, pack: str = DEFAULT_PACK) -> dict:
+    """레버 노드에서 raises/lowers/affects 엣지를 따라 기대 효과를 나열한다."""
+    buf = _get_pack(pack)
+    if lever_id not in buf["nodes"]:
+        return {"error": f"레버 노드 없음: {lever_id}"}
+    effects = []
+    for e in buf["edges"]:
+        if e["from_id"] != lever_id or e["relation"] not in ("raises", "lowers", "affects"):
+            continue
+        t = buf["nodes"].get(e["to_id"], {})
+        effects.append({"relation": e["relation"], "target": e["to_id"],
+                        "target_label": t.get("properties", {}).get("label", e["to_id"]),
+                        "target_space": t.get("space"),
+                        "edge_properties": e.get("properties", {})})
+    props = buf["nodes"][lever_id].get("properties", {})
+    return {"lever": lever_id, "label": props.get("label"),
+            "applies_when": props.get("applies_when"), "tradeoffs": props.get("tradeoffs"),
+            "effects": effects,
+            "note": "연구 근거 기반 기대 효과입니다. 직접 적용 전 로컬 검증(local_validation_required)이 필요합니다."}
+
+
+@mcp.tool()
 def ontology_add_node(space: str, node_type: str, node_id: str,
                        properties: dict | None = None, pack: str = DEFAULT_PACK) -> dict:
     """노드 하나를 현재 팩의 인메모리 버퍼에만 추가한다 (외부 DB 쓰기 없음)."""
