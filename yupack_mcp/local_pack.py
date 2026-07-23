@@ -566,14 +566,57 @@ def get(handle: str) -> LocalPack | None:
     return _HANDLES.get(handle)
 
 
+def _scan_pack_dir() -> None:
+    """YUPACK_PACK_DIR(팩 서재 폴더) 안의 zip을 전부 연다 (새 파일만)."""
+    d = os.environ.get("YUPACK_PACK_DIR")
+    if not d:
+        return
+    d = os.path.expanduser(d)
+    if not os.path.isdir(d):
+        return
+    opened = {pk.zip_path for pk in _HANDLES.values()}
+    for fn in sorted(os.listdir(d)):
+        path = os.path.join(d, fn)
+        if fn.endswith(".zip") and path not in opened:
+            try:
+                open_local(path)
+            except Exception:
+                pass  # 깨진 zip은 건너뜀
+
+
 def default_pack() -> "LocalPack | None":
-    """마지막으로 연 팩. 없고 YUPACK_AUTO_OPEN이 있으면 그 zip을 연다."""
+    """마지막으로 연 팩. 없으면 YUPACK_AUTO_OPEN 또는 YUPACK_PACK_DIR에서 연다."""
+    _scan_pack_dir()
     if _HANDLES:
         return next(reversed(_HANDLES.values()))
     auto = os.environ.get("YUPACK_AUTO_OPEN")
     if auto and os.path.exists(os.path.expanduser(auto)):
         return _HANDLES[open_local(auto)["pack_handle"]]
     return None
+
+
+def ask_all(question: str, top_k: int = 6) -> dict:
+    """열린 모든 팩(서재 전체)에 질의해 가장 근거가 강한 팩의 답을 반환한다."""
+    _scan_pack_dir()
+    if not _HANDLES:
+        auto = os.environ.get("YUPACK_AUTO_OPEN")
+        if auto and os.path.exists(os.path.expanduser(auto)):
+            open_local(auto)
+    if not _HANDLES:
+        return {"error": "열린 팩이 없습니다. YUPACK_PACK_DIR 폴더에 팩 zip을 넣거나 pack_open_local을 호출하세요."}
+    best = None
+    for pk in _HANDLES.values():
+        a = pk.ask(question, top_k)
+        if a.get("status") != "grounded":
+            continue
+        top = a["answer_candidates"][0]["score"] if a.get("answer_candidates") else 0
+        if best is None or top > best[0]:
+            best = (top, a)
+    if best:
+        return best[1]
+    return {"status": "no_local_evidence",
+            "searched_packs": [pk.pack_id for pk in _HANDLES.values()],
+            "message": "서재의 어느 팩에도 이 질문을 뒷받침할 근거가 없습니다. 팩 밖 지식으로 답하지 마세요."}
 
 
 def close(handle: str) -> dict:

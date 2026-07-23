@@ -532,11 +532,12 @@ def pack_ask_local(question: str, pack_handle: str = "", top_k: int = 6) -> dict
     pack_handle을 생략하면 YUPACK_AUTO_OPEN 팩 또는 마지막으로 연 팩을 쓴다.
     에이전트 개발·MCP·메모리·프롬프트 인젝션·회귀 질문이면 답하기 전에 먼저 호출할 것."""
     from . import local_pack
-    pk = local_pack.get(pack_handle) if pack_handle else local_pack.default_pack()
-    if not pk:
-        return {"error": "열린 팩이 없습니다. pack_open_local(zip_path)을 먼저 호출하거나 "
-                          "YUPACK_AUTO_OPEN 환경변수에 zip 경로를 지정하세요."}
-    return pk.ask(question, top_k)
+    if pack_handle:
+        pk = local_pack.get(pack_handle)
+        if not pk:
+            return {"error": f"핸들 없음: {pack_handle}"}
+        return pk.ask(question, top_k)
+    return local_pack.ask_all(question, top_k)
 
 
 @mcp.tool()
