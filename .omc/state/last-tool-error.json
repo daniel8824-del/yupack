@@ -1,7 +1,7 @@
 {
   "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"cd \\\"$HOME/.claude/jobs/45d3e8c8/tmp/yupack-build/yupack\\\"\\npython3 - <<'PY'\\np='yupack_mcp/server.py'; s=open(p).read()\\ns=s.replace('''핵심 원칙: 모든 쓰기는 서버 인메모리 팩 버퍼(PACKS)로만 간다. 외부 DB(Neo4j...",
-  "error": "Exit code 1\n1\nTraceback (most recent call last):\n  File \u001b[35m\"<string>\"\u001b[0m, line \u001b[35m3\u001b[0m, in \u001b[35m<module>\u001b[0m\n    import importlib, yupack_mcp.server as sv\n  File \u001b[35m\"/Users/yedulab/.claude/jobs/45d3e8c8/tmp/yupack-build/yupack/yupack_mcp/server.py\"\u001b[0m, line \u001b[35m19\u001b[0m, in \u001b[35m<module>\u001b[0m\n    from mcp.server.fastmcp import FastMCP\n\u001b[1;35mModuleNotFoundError\u001b[0m: \u001b[35mNo module named 'mcp'\u001b[0m",
-  "timestamp": "2026-07-23T02:51:13.535Z",
+  "tool_input_preview": "{\"command\":\"U=https://yupack-production.up.railway.app/mcp\\ncall() { # $1=id $2=body → 세션 유지 위해 헤더 파일 사용\\n  curl -s -D /tmp/yp-h.txt -X POST \\\"$U\\\" -H 'Content-Type: application/json' -H 'Accept: appl...",
+  "error": "Exit code 11\nSID=fef77f178389449594cbb6a0aac3ff56\n\"stores\\\": {\\n    \\\"buffer\\\": \\\"ok\\\"\\n  }\nhttps://yupack-production.up.railway.app/download/yCIOz3kLs8w\nArchive:  /tmp/yp-pack.zip\n  Length      Date    Time    Name\n---------  ---------- -----   ----\n      278  07-23-2026 02:52   pack.json\n       89  07-23-2026 02:52   �??�??�??�?��?�.md\n---------                     -------\n      367                     2 files\ncaution: filename not matched:  pack.yaml",
+  "timestamp": "2026-07-23T02:52:37.338Z",
   "retry_count": 1
 }

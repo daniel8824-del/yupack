@@ -290,7 +290,7 @@ def ontology_query(question: str, limit: int = 5, pack: str = DEFAULT_PACK) -> d
 
 @mcp.tool()
 def pack_ask(question: str, pack: str = DEFAULT_PACK) -> dict:
-    """질문에 가장 잘 맞는 버퍼 노드를 찾고 prerequisite_of/related_to 엣지를 최대 3홉 따라간다."""
+    """질문에 가장 잘 맞는 버퍼 노드를 찾고 그래프 엣지를 최대 3홉 따라가며 근거 사슬을 만든다."""
     buffer_hits = _buffer_search(pack, question, 1)
     if not buffer_hits:
         cloud_hits = _cloud_search(question, 5)
@@ -304,8 +304,6 @@ def pack_ask(question: str, pack: str = DEFAULT_PACK) -> dict:
     for _ in range(3):
         step = None
         for e in edges:
-            if e["relation"] not in ("prerequisite_of", "related_to"):
-                continue
             other = e["to_id"] if e["from_id"] == current else (e["from_id"] if e["to_id"] == current else None)
             if other and other not in visited:
                 step = (e, other)
@@ -325,10 +323,76 @@ def pack_ask(question: str, pack: str = DEFAULT_PACK) -> dict:
     prev = matched["id"]
     for c in chain:
         next_id = c["to"] if c["from"] == prev else c["from"]
-        explanation += f" → (선수) → {_label(next_id)}"
+        explanation += f" -({c['rel']})-> {_label(next_id)}"
         prev = next_id
     cloud_hits = _cloud_search(question, 3)
     return {"matched": matched, "chain": chain, "explanation": explanation, "참고(cloud)": cloud_hits}
+
+
+_UPLOADS: dict[str, bytes] = {}  # token -> 업로드된 zip bytes
+
+
+def _import_pack_zip(data: bytes, pack: str) -> dict:
+    """정본 계약 zip(nodes.jsonl + edges.jsonl, 하위폴더 허용)을 팩 버퍼로 적재한다."""
+    z = zipfile.ZipFile(io.BytesIO(data))
+    names = z.namelist()
+
+    def _find(suffix: str) -> str | None:
+        cands = [n for n in names if n.endswith(suffix) and "__MACOSX" not in n]
+        return min(cands, key=len) if cands else None
+
+    nodes_f, edges_f = _find("nodes.jsonl"), _find("edges.jsonl")
+    if not nodes_f:
+        return {"error": f"zip 안에 nodes.jsonl이 없습니다. 파일 목록: {names[:10]}"}
+    buf = {"nodes": {}, "edges": [], "schema_packs": []}
+    for line in z.read(nodes_f).decode("utf-8").splitlines():
+        if not line.strip():
+            continue
+        d = json.loads(line)
+        nid = d.get("id") or d.get("node_id")
+        props = dict(d.get("properties", {}))
+        # 정본은 label이 top-level에 올 수 있음 → properties로 정규화
+        if "label" not in props and d.get("label"):
+            props["label"] = d["label"]
+        buf["nodes"][nid] = {"space": d.get("space", "concept"),
+                             "node_type": d.get("node_type") or d.get("type", "Concept"),
+                             "properties": props}
+    if edges_f:
+        for line in z.read(edges_f).decode("utf-8").splitlines():
+            if not line.strip():
+                continue
+            d = json.loads(line)
+            buf["edges"].append({
+                "from_space": d.get("from_space", ""),
+                "from_id": d.get("from_id") or d.get("source"),
+                "relation": d.get("relation", "related_to"),
+                "to_space": d.get("to_space", ""),
+                "to_id": d.get("to_id") or d.get("target"),
+                "properties": d.get("properties", {}),
+            })
+    PACKS[pack] = buf
+    status = _persist(pack)
+    return {"pack": pack, "nodes": len(buf["nodes"]), "edges": len(buf["edges"]),
+            "stores": {"buffer": "ok", "sqlite": status}}
+
+
+@mcp.tool()
+def pack_import(source: str, pack: str = "정본팩") -> dict:
+    """정본 zip을 팩으로 가져온다. source = 업로드 토큰(/upload 응답) 또는 zip URL.
+
+    가져온 뒤에는 pack_ask/ontology_query에 pack 이름을 주면 바로 질의된다.
+    """
+    data = _UPLOADS.pop(source, None)
+    if data is None and source.startswith("http"):
+        import urllib.request
+        with urllib.request.urlopen(source, timeout=60) as r:
+            data = r.read()
+    if data is None:
+        return {"error": "source가 업로드 토큰도 URL도 아닙니다. 먼저 zip을 POST /upload 하세요."}
+    try:
+        return _import_pack_zip(data, pack)
+    except Exception as e:
+        return {"error": f"가져오기 실패: {e}"}
 
 
 @mcp.tool()
@@ -417,6 +481,19 @@ def build_app():
             return Response(data, media_type="application/zip",
                             headers={"Content-Disposition": 'attachment; filename="yupack.zip"'})
         app.router.routes.append(Route("/download/{token}", download))
+
+        async def upload(request):
+            data = await request.body()
+            if not data:
+                return Response("빈 본문", status_code=400)
+            tok = secrets.token_urlsafe(8)
+            _UPLOADS[tok] = data
+            if len(_UPLOADS) > 20:
+                for k in list(_UPLOADS)[:10]:
+                    _UPLOADS.pop(k, None)
+            return Response(json.dumps({"token": tok, "bytes": len(data)}),
+                            media_type="application/json")
+        app.router.routes.append(Route("/upload", upload, methods=["POST"]))
     except Exception:
         pass
     return app
