@@ -26,8 +26,10 @@ def _pick_model() -> tuple[str, int]:
     forced = os.environ.get("YUPACK_EMBED_MODEL")
     if forced == "bge-m3":
         return "bge-m3", 1024
-    if forced == "text-embedding-3-large" or os.environ.get("OPENAI_API_KEY"):
-        return "text-embedding-3-large", 3072
+    if forced:
+        return forced, {"text-embedding-3-large": 3072, "text-embedding-3-small": 1536}.get(forced, 1024)
+    if os.environ.get("OPENAI_API_KEY"):
+        return "text-embedding-3-small", 1536
     return "bge-m3", 1024
 
 
