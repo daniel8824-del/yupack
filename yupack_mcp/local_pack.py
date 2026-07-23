@@ -440,6 +440,16 @@ def get(handle: str) -> LocalPack | None:
     return _HANDLES.get(handle)
 
 
+def default_pack() -> "LocalPack | None":
+    """마지막으로 연 팩. 없고 YUPACK_AUTO_OPEN이 있으면 그 zip을 연다."""
+    if _HANDLES:
+        return next(reversed(_HANDLES.values()))
+    auto = os.environ.get("YUPACK_AUTO_OPEN")
+    if auto and os.path.exists(os.path.expanduser(auto)):
+        return _HANDLES[open_local(auto)["pack_handle"]]
+    return None
+
+
 def close(handle: str) -> dict:
     pk = _HANDLES.pop(handle, None)
     if pk:

@@ -526,13 +526,16 @@ def pack_status(pack_handle: str) -> dict:
 
 
 @mcp.tool()
-def pack_ask_local(pack_handle: str, question: str, top_k: int = 6) -> dict:
+def pack_ask_local(question: str, pack_handle: str = "", top_k: int = 6) -> dict:
     """열린 로컬 팩에 질의한다. lexical+vector+graph 3중 검색, 근거 카드와
-    retrieval_trace를 반환하며 근거가 없으면 no_local_evidence를 반환한다."""
+    retrieval_trace를 반환하며 근거가 없으면 no_local_evidence를 반환한다.
+    pack_handle을 생략하면 YUPACK_AUTO_OPEN 팩 또는 마지막으로 연 팩을 쓴다.
+    에이전트 개발·MCP·메모리·프롬프트 인젝션·회귀 질문이면 답하기 전에 먼저 호출할 것."""
     from . import local_pack
-    pk = local_pack.get(pack_handle)
+    pk = local_pack.get(pack_handle) if pack_handle else local_pack.default_pack()
     if not pk:
-        return {"error": f"핸들 없음: {pack_handle}. 먼저 pack_open_local을 호출하세요."}
+        return {"error": "열린 팩이 없습니다. pack_open_local(zip_path)을 먼저 호출하거나 "
+                          "YUPACK_AUTO_OPEN 환경변수에 zip 경로를 지정하세요."}
     return pk.ask(question, top_k)
 
 
