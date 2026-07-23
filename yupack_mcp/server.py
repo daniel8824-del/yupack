@@ -184,7 +184,8 @@ def _buffer_search(pack: str, question: str, limit: int) -> list[dict]:
                     overlap += 1
         if overlap:
             scored.append({"id": node_id, "label": label, "definition": definition,
-                            "score": overlap, "source": "buffer"})
+                            "score": overlap, "exact": len(q_tokens & n_tokens),
+                            "source": "buffer"})
     scored.sort(key=lambda r: r["score"], reverse=True)
     return scored[:limit]
 
@@ -292,8 +293,8 @@ def ontology_query(question: str, limit: int = 5, pack: str = DEFAULT_PACK) -> d
 def pack_ask(question: str, pack: str = DEFAULT_PACK) -> dict:
     """질문에 가장 잘 맞는 버퍼 노드를 찾고 그래프 엣지를 최대 3홉 따라가며 근거 사슬을 만든다."""
     buffer_hits = _buffer_search(pack, question, 1)
-    # 근거 부족 게이트: 약한 토큰 겹침(전방일치 잡음)만으로는 매칭으로 치지 않는다
-    if buffer_hits and buffer_hits[0]["score"] < 4:
+    # 근거 부족 게이트: 정확히 겹친 토큰이 2개 미만이면(전방일치 잡음뿐) 매칭으로 치지 않는다
+    if buffer_hits and buffer_hits[0].get("exact", 0) < 2 and buffer_hits[0]["score"] < 10:
         return {"matched": None, "chain": [], "status": "no_grounded_match",
                 "explanation": "팩에 이 질문을 뒷받침할 근거가 없습니다. 팩 밖 지식으로 답하지 마세요."}
     if not buffer_hits:
