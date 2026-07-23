@@ -1,4 +1,4 @@
-"""yupack — 수업용 팩 공방 MCP 서버.
+"""yupack: 수업용 팩 공방 MCP 서버.
 
 핵심 원칙: 모든 쓰기는 팩 버퍼(PACKS) + 로컬 SQLite에만 간다. 외부 프로덕션 DB(Neo4j)에는
 절대 쓰지 않는다 (읽기 전용 Cypher만). pack_save는 정본 임포터 계약 zip(nodes.jsonl +

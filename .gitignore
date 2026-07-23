@@ -1,0 +1,3 @@
+__pycache__/
+*.pyc
+yupack_mcp/yupack.db
