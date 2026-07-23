@@ -248,16 +248,21 @@ def ontology_extract(text: str, pack: str = DEFAULT_PACK, max_nodes: int = 8) ->
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
         return {"error": "OPENAI_API_KEY 없음: extract는 LLM이 필요합니다."}
-    from openai import OpenAI
-    client = OpenAI(api_key=key)
+    import urllib.request  # openai 패키지 없이 표준 라이브러리로 호출
     model = os.environ.get("OPENAI_EXTRACT_MODEL", "gpt-4o-mini")
     prompt = (f"다음 텍스트에서 핵심 개념 최대 {max_nodes}개와 개념 사이 관계를 추출해 JSON으로만 답하라. "
               '형식: {"nodes":[{"id":"c:슬러그","label":"...","definition":"..."}],'
               '"edges":[{"from":"c:슬러그","relation":"prerequisite_of|related_to|part_of","to":"c:슬러그"}]}'
               f"\n\n텍스트:\n{text[:6000]}")
-    resp = client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}],
-                                          response_format={"type": "json_object"})
-    data = json.loads(resp.choices[0].message.content)
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}],
+                       "response_format": {"type": "json_object"}}).encode()
+    req = urllib.request.Request("https://api.openai.com/v1/chat/completions", body,
+                                 {"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
+    try:
+        resp = json.load(urllib.request.urlopen(req, timeout=120))
+    except Exception as e:
+        return {"error": f"LLM 호출 실패: {e}"}
+    data = json.loads(resp["choices"][0]["message"]["content"])
     buf = _get_pack(pack)
     added_n, added_e = 0, 0
     for n in data.get("nodes", [])[:max_nodes]:
@@ -607,6 +612,61 @@ def pack_create(pack: str) -> dict:
         return {"error": f"이미 존재: {pack}"}
     _get_pack(pack)
     return {"created": pack, "stores": {"buffer": "ok", "sqlite": _persist(pack)}}
+
+
+@mcp.tool()
+def pack_ingest_local_zip(zip_path: str, pack: str = DEFAULT_PACK,
+                           max_files: int = 0, max_nodes_per_file: int = 6) -> dict:
+    """로컬 md 묶음 zip을 한 번에 읽어 파일마다 개념·관계를 추출해 팩에 누적한다.
+
+    원본 노트 zip(예: 921개 md)을 통째로 넣어 정본 팩을 만드는 진입점.
+    각 md는 ontology_extract와 같은 방식으로 LLM 추출한다(OPENAI_API_KEY 필요).
+    max_files=0이면 전부. 대량이면 파일마다 LLM 호출이라 비용·시간이 든다.
+    각 파일은 evidence 노드(원문)로도 남겨 근거를 보존한다.
+    """
+    zip_path = os.path.expanduser(zip_path)
+    if not os.path.exists(zip_path):
+        return {"error": f"zip이 없습니다: {zip_path}"}
+    if not os.environ.get("OPENAI_API_KEY"):
+        return {"error": "OPENAI_API_KEY 없음: 대량 추출은 LLM이 필요합니다. "
+                          "임베딩만 있는 팩이 필요하면 build 스크립트로 만든 정본을 pack_import 하세요."}
+    z = zipfile.ZipFile(zip_path)
+    mds = [n for n in z.namelist()
+           if n.lower().endswith((".md", ".markdown", ".txt"))
+           and "__MACOSX" not in n and not n.endswith("/")]
+    if max_files > 0:
+        mds = mds[:max_files]
+    if not mds:
+        return {"error": "zip 안에 md/txt 파일이 없습니다."}
+    _get_pack(pack)
+    done, nodes_added, edges_added, errors = 0, 0, 0, 0
+    for name in mds:
+        try:
+            text = z.read(name).decode("utf-8", errors="ignore")
+        except Exception:
+            errors += 1
+            continue
+        if not text.strip():
+            continue
+        # 원문을 evidence 노드로 보존
+        src_id = f"src:{_safe_filename(os.path.basename(name))[:40]}"
+        _get_pack(pack)["nodes"][src_id] = {
+            "space": "evidence", "node_type": "TextUnit",
+            "properties": {"label": os.path.basename(name), "text": text[:4000],
+                            "source_locator": name}}
+        nodes_added += 1
+        # 개념·관계 추출 (extract 재사용)
+        r = ontology_extract(text=text, pack=pack, max_nodes=max_nodes_per_file)
+        if "error" in r:
+            errors += 1
+        else:
+            nodes_added += r.get("added", {}).get("nodes", 0)
+            edges_added += r.get("added", {}).get("edges", 0)
+        done += 1
+    return {"ingested_files": done, "total_files": len(mds),
+            "nodes_added": nodes_added, "edges_added": edges_added, "errors": errors,
+            "stores": {"buffer": "ok", "sqlite": _persist(pack)},
+            "next": f"pack_save(pack=\"{pack}\", save_to=\"<폴더>\")로 질의 가능 팩을 저장하세요."}
 
 
 @mcp.tool()
