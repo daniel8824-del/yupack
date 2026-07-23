@@ -20,8 +20,18 @@ import urllib.request
 import zipfile
 
 EMBED_URL = os.environ.get("YUPACK_EMBED_URL", "http://127.0.0.1:8000/v1/embeddings")
-EMBED_MODEL = os.environ.get("YUPACK_EMBED_MODEL", "bge-m3")
-EMBED_DIM = 1024
+
+# 임베딩 프로바이더: OPENAI_API_KEY 있으면 OpenAI 3-large(요건), 없으면 로컬 bge-m3 폴백
+def _pick_model() -> tuple[str, int]:
+    forced = os.environ.get("YUPACK_EMBED_MODEL")
+    if forced == "bge-m3":
+        return "bge-m3", 1024
+    if forced == "text-embedding-3-large" or os.environ.get("OPENAI_API_KEY"):
+        return "text-embedding-3-large", 3072
+    return "bge-m3", 1024
+
+
+EMBED_MODEL, EMBED_DIM = _pick_model()
 
 _HANDLES: dict[str, "LocalPack"] = {}
 
@@ -34,11 +44,21 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _embed(texts: list[str]) -> list[list[float]] | None:
+def _embed(texts: list[str], model: str | None = None) -> list[list[float]] | None:
+    model = model or EMBED_MODEL
     try:
-        req = urllib.request.Request(
-            EMBED_URL, json.dumps({"model": EMBED_MODEL, "input": texts}).encode(),
-            {"Content-Type": "application/json"})
+        if model.startswith("text-embedding"):
+            key = os.environ.get("OPENAI_API_KEY")
+            if not key:
+                return None
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/embeddings",
+                json.dumps({"model": model, "input": texts}).encode(),
+                {"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
+        else:
+            req = urllib.request.Request(
+                EMBED_URL, json.dumps({"model": model, "input": texts}).encode(),
+                {"Content-Type": "application/json"})
         d = json.load(urllib.request.urlopen(req, timeout=600))
         return [r["embedding"] for r in d["data"]]
     except Exception:
@@ -353,6 +373,13 @@ class LocalPack:
         if os.path.exists(vm):
             self.vec_meta = [json.loads(l) for l in open(vm)]
             self.vecs = open(os.path.join(root, vdir, "vectors.bin"), "rb").read()
+        # 팩에 기록된 임베딩 모델·차원 (질의 임베딩은 반드시 이걸 따른다)
+        self.embed_model, self.dim = EMBED_MODEL, EMBED_DIM
+        ej = os.path.join(root, "embeddings.json")
+        if os.path.exists(ej):
+            em = json.load(open(ej, encoding="utf-8"))
+            if em.get("model"):
+                self.embed_model, self.dim = em["model"], em.get("dim") or EMBED_DIM
         self._audit("open", f"mode={mode}")
 
     def _read(self, name: str) -> str:
@@ -401,14 +428,15 @@ class LocalPack:
     def vector(self, q: str, k: int = 8) -> list[dict]:
         if not self.vec_meta:
             return []
-        qv = _embed([q])
+        # 질의 임베딩은 팩을 구운 모델과 동일해야 한다 (embeddings.json 기록 기준)
+        qv = _embed([q], model=self.embed_model)
         if qv is None:
             return []
         qv = qv[0]
-        row = EMBED_DIM * 4
+        row = self.dim * 4
         best = []
         for m in self.vec_meta:
-            v = struct.unpack_from(f"{EMBED_DIM}f", self.vecs, m["row"] * row)
+            v = struct.unpack_from(f"{self.dim}f", self.vecs, m["row"] * row)
             best.append((sum(a * b for a, b in zip(qv, v)), m["id"]))
         best.sort(reverse=True)
         return [{"id": nid, "cosine": round(s, 4)} for s, nid in best[:k]]
@@ -459,14 +487,19 @@ class LocalPack:
             out["direct_evidence"] = [self.card(e) for e in refs if e in self.evidence][:4]
         return out
 
+    def _cos_threshold(self) -> float:
+        # 실측 캘리브레이션: bge-m3는 유근거 0.78+/무근거 0.74-, 3-large는 0.43+/0.23-
+        return 0.35 if str(self.embed_model).startswith("text-embedding") else 0.76
+
     def ask(self, question: str, top_k: int = 6) -> dict:
+        thr = self._cos_threshold()
         lex = self.lexical(question, 8)
         vec = self.vector(question, 8)
         score: dict[str, float] = {}
         for i, h in enumerate(lex):
             score[h["id"]] = score.get(h["id"], 0) + (8 - i)
         for i, h in enumerate(vec):
-            if h["cosine"] >= 0.76:
+            if h["cosine"] >= thr:
                 score[h["id"]] = score.get(h["id"], 0) + (8 - i) + 2
         ranked = sorted(score.items(), key=lambda kv: -kv[1])
         # 근거 게이트: 벡터(>=0.76) 또는 강한 어휘 일치(4자+ 토큰 정확 일치 / 2토큰 교집합)
@@ -479,7 +512,7 @@ class LocalPack:
             if len(inter) >= 2 or any(len(t) >= 4 for t in inter):
                 lex_strong = True
                 break
-        vec_strong = bool(vec) and vec[0]["cosine"] >= 0.76
+        vec_strong = bool(vec) and vec[0]["cosine"] >= thr
         if not ranked or not (vec_strong or lex_strong):
             self._audit("ask", f"no_local_evidence: {question[:80]}")
             return {"status": "no_local_evidence", "local_pack_id": self.pack_id,
@@ -511,7 +544,7 @@ class LocalPack:
                                if c.get("id") and c.get("review_status")},
             "retrieval_trace": {"lexical_hits": lex, "vector_hits": vec[:5],
                                  "graph_path": gtrace[:30],
-                                 "rerank": "lexical rank + vector rank(+2 boost), cosine>=0.76 (bge-m3 실측 캘리브레이션)"},
+                                 "rerank": f"lexical rank + vector rank(+2 boost), cosine>={thr} ({self.embed_model} 실측 캘리브레이션)"},
             "local_pack_id": self.pack_id,
             "manifest_hash": self.manifest_hash,
             "governance": {"decision_core": "local_validation_required",
