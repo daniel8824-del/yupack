@@ -567,7 +567,8 @@ def pack_list() -> dict:
 
 
 @mcp.tool()
-def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True) -> dict:
+def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
+              save_to: str | None = None) -> dict:
     """현재 팩을 질의 가능 완성 zip으로 저장해 다운로드 링크를 준다.
 
     구조(표준 계약): pack.yaml + nodes/edges/evidence/reviews.jsonl + query-docs/ +
@@ -629,13 +630,30 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True) -> dict
                            f"# {label}\n\n{props.get('definition', props.get('text', ''))}\n")
         data = open(out, "rb").read()
 
-    tok = secrets.token_urlsafe(8)
-    _BUNDLES[tok] = data
-    base = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
-    public_base = f"https://{base}" if base else "http://localhost:8000"
-    return {"download_url": f"{public_base}/download/{tok}",
-            "structure": r["files"] if isinstance(r.get("files"), list) else None,
-            "counts": r["counts"], "embeddings": r["embeddings"]}
+    result = {"structure": r["files"] if isinstance(r.get("files"), list) else None,
+              "counts": r["counts"], "embeddings": r["embeddings"]}
+    # 로컬 모드: save_to 경로(생략 시 팩 서재 YUPACK_PACK_DIR)에 직접 저장
+    dest_dir = save_to or os.environ.get("YUPACK_PACK_DIR")
+    if dest_dir:
+        dest_dir = os.path.expanduser(dest_dir)
+        if os.path.isdir(dest_dir) or not os.path.splitext(dest_dir)[1]:
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, f"{_safe_filename(pack)}-{today}-queryable.zip")
+        else:
+            dest = dest_dir
+        with open(dest, "wb") as fh:
+            fh.write(data)
+        result["saved_to"] = dest
+        result["note"] = "팩 서재에 저장됨. 바로 질의 가능합니다."
+    if os.environ.get("RAILWAY_PUBLIC_DOMAIN"):
+        tok = secrets.token_urlsafe(8)
+        _BUNDLES[tok] = data
+        result["download_url"] = f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN']}/download/{tok}"
+    elif "saved_to" not in result:
+        tok = secrets.token_urlsafe(8)
+        _BUNDLES[tok] = data
+        result["download_url"] = f"http://localhost:8000/download/{tok}"
+    return result
 
 
 from . import governance as _governance
