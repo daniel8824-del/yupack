@@ -1,14 +1,17 @@
 """yupack — 수업용 팩 공방 MCP 서버.
 
-핵심 원칙: 모든 쓰기는 서버 인메모리 팩 버퍼(PACKS)로만 간다. 외부 DB(Neo4j)에는
-절대 쓰지 않는다 (읽기 전용 Cypher만). pack_save로 버퍼를 zip으로 꺼내 받는다.
+핵심 원칙: 모든 쓰기는 팩 버퍼(PACKS) + 로컬 SQLite에만 간다. 외부 프로덕션 DB(Neo4j)에는
+절대 쓰지 않는다 (읽기 전용 Cypher만). pack_save는 정본 임포터 계약 zip(nodes.jsonl +
+edges.jsonl + pack.yaml)을 꺼내 준다.
 """
 from __future__ import annotations
+import datetime
 import io
 import json
 import os
 import re
 import secrets
+import sqlite3
 import zipfile
 from pathlib import Path
 from urllib.parse import quote
@@ -32,8 +35,43 @@ _BUNDLES: dict[str, bytes] = {}  # token -> zip bytes (pack_save 다운로드)
 _PRIVATE_PREFIXES = ("personal:", "zzdemo:", "class:test:")
 
 
+# ----------------------- SQLite 영속화 (로컬 DB, 프로덕션 DB 아님) -----------------------
+# ponytail: 팩 단위 JSON blob upsert. 수업/개인 규모용. 대량 배치는 build 스크립트 영역.
+_DB_PATH = os.environ.get("YUPACK_DB") or (
+    "/data/yupack.db" if os.path.isdir("/data") else str(Path(__file__).parent / "yupack.db"))
+
+
+def _db():
+    conn = sqlite3.connect(_DB_PATH)
+    conn.execute("CREATE TABLE IF NOT EXISTS packs (name TEXT PRIMARY KEY, data TEXT NOT NULL)")
+    return conn
+
+
+def _load_packs() -> None:
+    try:
+        with _db() as conn:
+            for name, data in conn.execute("SELECT name, data FROM packs"):
+                PACKS[name] = json.loads(data)
+    except Exception:
+        pass  # DB 문제는 buffer-only로 폴백
+
+
+def _persist(pack: str) -> str:
+    try:
+        with _db() as conn:
+            conn.execute("INSERT INTO packs(name, data) VALUES(?, ?) "
+                         "ON CONFLICT(name) DO UPDATE SET data=excluded.data",
+                         (pack, json.dumps(PACKS[pack], ensure_ascii=False)))
+        return "ok"
+    except Exception as e:
+        return f"failed({e})"
+
+
 def _get_pack(pack: str) -> dict:
     return PACKS.setdefault(pack, {"nodes": {}, "edges": [], "schema_packs": []})
+
+
+_load_packs()
 
 
 def _space_of(node_type: str) -> str | None:
@@ -200,7 +238,7 @@ def ontology_add_node(space: str, node_type: str, node_id: str,
         return {"error": f"알 수 없는 space: {space}. 사용 가능: {list(MANIFEST['spaces'])}"}
     node_data = {"space": space, "node_type": node_type, "properties": properties or {}}
     _get_pack(pack)["nodes"][node_id] = node_data
-    return {"stores": {"buffer": "ok"}, "node_data": {node_id: node_data}}
+    return {"stores": {"buffer": "ok", "sqlite": _persist(pack)}, "node_data": {node_id: node_data}}
 
 
 @mcp.tool()
@@ -215,7 +253,7 @@ def ontology_add_edge(from_space: str, from_id: str, relation: str, to_space: st
     edge = {"from_space": from_space, "from_id": from_id, "relation": relation,
             "to_space": to_space, "to_id": to_id, "properties": properties or {}}
     _get_pack(pack)["edges"].append(edge)
-    return {"stores": {"buffer": "ok"}, "edge": edge}
+    return {"stores": {"buffer": "ok", "sqlite": _persist(pack)}, "edge": edge}
 
 
 @mcp.tool()
@@ -225,7 +263,7 @@ def ontology_ingest(text: str, source_id: str | None = None, pack: str = DEFAULT
     node_data = {"space": "evidence", "node_type": "TextUnit",
                  "properties": {"text": text, "label": node_id}}
     _get_pack(pack)["nodes"][node_id] = node_data
-    return {"stores": {"buffer": "ok"}, "node_data": {node_id: node_data}}
+    return {"stores": {"buffer": "ok", "sqlite": _persist(pack)}, "node_data": {node_id: node_data}}
 
 
 @mcp.tool()
@@ -305,13 +343,30 @@ def pack_list() -> dict:
 
 @mcp.tool()
 def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True) -> dict:
-    """현재 팩 버퍼를 zip(pack.json + 노드별 md + embeddings.json)으로 만들어 다운로드 링크를 준다."""
+    """현재 팩을 정본 임포터 계약 zip(nodes.jsonl + edges.jsonl + pack.yaml)으로 만들어 다운로드 링크를 준다.
+
+    노드별 md(notes/)와 embeddings.json은 부속으로 동봉한다.
+    """
     buf = _get_pack(pack)
     files: dict[str, str] = {}
-    files["pack.json"] = json.dumps({
-        "nodes": buf["nodes"], "edges": buf["edges"],
-        "schema_packs": buf["schema_packs"], "manifest_version": MANIFEST["version"],
-    }, ensure_ascii=False, indent=2)
+
+    # 정본 계약: 임포터가 먹는 jsonl
+    files["nodes.jsonl"] = "\n".join(
+        json.dumps({"id": nid, "space": n["space"], "node_type": n["node_type"],
+                    "properties": n.get("properties", {})}, ensure_ascii=False)
+        for nid, n in buf["nodes"].items())
+    files["edges.jsonl"] = "\n".join(
+        json.dumps(e, ensure_ascii=False) for e in buf["edges"])
+    today = datetime.date.today().isoformat()
+    files["pack.yaml"] = (
+        f"pack_id: {_safe_filename(pack)}-{today}\n"
+        f"title: \"{pack}\"\n"
+        f"version: 1.0.0\n"
+        f"created: {today}\n"
+        f"manifest_version: \"{MANIFEST['version']}\"\n"
+        f"schema_packs: {json.dumps(buf['schema_packs'], ensure_ascii=False)}\n"
+        f"counts:\n  nodes: {len(buf['nodes'])}\n  edges: {len(buf['edges'])}\n"
+        f"storage: \"yupack local (sqlite/buffer), production DB 미접촉\"\n")
 
     for node_id, node in buf["nodes"].items():
         props = node.get("properties", {})
@@ -319,7 +374,7 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True) -> dict
         definition = props.get("definition", props.get("text", ""))
         md = (f"---\nid: {node_id}\nspace: {node['space']}\ntype: {node['node_type']}\n---\n"
               f"# {label}\n\n{definition}\n")
-        files[f"{_safe_filename(label)}.md"] = md
+        files[f"notes/{_safe_filename(label)}.md"] = md
 
     embeddings_status = "skipped(no key)"
     if include_embeddings:

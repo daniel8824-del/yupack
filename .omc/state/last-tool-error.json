@@ -1,7 +1,7 @@
 {
   "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"python3 - <<'EOF'\\nimport urllib.request, json, re\\nBASE='https://yupack-production.up.railway.app/mcp'\\nsid=[None]\\ndef rpc(method, params=None, rid=1):\\n    h={'Content-Type':'applicatio...",
-  "error": "Exit code 1\nTraceback (most recent call last):\n  File \u001b[35m\"<stdin>\"\u001b[0m, line \u001b[35m20\u001b[0m, in \u001b[35m<module>\u001b[0m\n  File \u001b[35m\"<stdin>\"\u001b[0m, line \u001b[35m8\u001b[0m, in \u001b[35mrpc\u001b[0m\n  File \u001b[35m\"/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/urllib/request.py\"\u001b[0m, line \u001b[35m187\u001b[0m, in \u001b[35murlopen\u001b[0m\n    return \u001b[31mopener.open\u001b[0m\u001b[1;31m(url, data, timeout)\u001b[0m\n           \u001b[31m~~~~~~~~~~~\u001b[0m\u001b[1;31m^^^^^^^^^^^^^^^^^^^^\u001b[0m\n  File \u001b[35m\"/opt/homebrew/C...",
-  "timestamp": "2026-07-22T09:17:30.124Z",
+  "tool_input_preview": "{\"command\":\"cd \\\"$HOME/.claude/jobs/45d3e8c8/tmp/yupack-build/yupack\\\"\\npython3 - <<'PY'\\np='yupack_mcp/server.py'; s=open(p).read()\\ns=s.replace('''핵심 원칙: 모든 쓰기는 서버 인메모리 팩 버퍼(PACKS)로만 간다. 외부 DB(Neo4j...",
+  "error": "Exit code 1\n1\nTraceback (most recent call last):\n  File \u001b[35m\"<string>\"\u001b[0m, line \u001b[35m3\u001b[0m, in \u001b[35m<module>\u001b[0m\n    import importlib, yupack_mcp.server as sv\n  File \u001b[35m\"/Users/yedulab/.claude/jobs/45d3e8c8/tmp/yupack-build/yupack/yupack_mcp/server.py\"\u001b[0m, line \u001b[35m19\u001b[0m, in \u001b[35m<module>\u001b[0m\n    from mcp.server.fastmcp import FastMCP\n\u001b[1;35mModuleNotFoundError\u001b[0m: \u001b[35mNo module named 'mcp'\u001b[0m",
+  "timestamp": "2026-07-23T02:51:13.535Z",
   "retry_count": 1
 }
