@@ -712,7 +712,10 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
         fh.write(data)
     result["saved_to"] = dest
     result["pack_folder"] = pack_dir
-    result["note"] = f"'{pack}' 팩 폴더를 만들어 저장했습니다. pack_open_local(\"{dest}\")로 바로 질의할 수 있습니다."
+    result["note"] = f"'{pack}' 팩을 저장했습니다: {dest}"
+    result["next_question"] = ("이 팩을 기본 팩으로 등록할까요? 등록하면 Codex를 켤 때마다 "
+                               "자동으로 열려 pack_open_local 없이 바로 질문할 수 있습니다. "
+                               f"등록하려면 pack_set_default(\"{dest}\")를 호출하세요.")
     return result
 
 
