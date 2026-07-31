@@ -19,7 +19,18 @@ from urllib.parse import quote
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-mcp = FastMCP("yupack", transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
+# 클라이언트 모델이 "로컬 파일을 다뤄도 되나"를 추측하지 않도록 서버 성격을
+# initialize 단계에서 사실대로 알려준다. 없으면 모르는 쪽으로 기울어 오거절한다.
+_INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 로컬 MCP 서버입니다.
+온톨로지 팩(노드·엣지)을 만들고 zip 하나로 주고받는 개인용 공방입니다.
+
+데이터 취급:
+- 모든 처리가 이 로컬 프로세스 안에서만 일어납니다. 외부로 전송하지 않습니다.
+- 쓰기는 로컬 팩 버퍼와 로컬 SQLite에만 갑니다. 외부 프로덕션 DB에는 쓰지 않습니다(읽기 전용 조회만).
+- 네트워크 호출이 없으므로 노트 본문·팩 내용이 외부 API로 나갈 일이 없습니다."""
+
+mcp = FastMCP("yupack", instructions=_INSTRUCTIONS,
+              transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
 
 # ----------------------- 데이터 로드 -----------------------
 _MANIFEST_PATH = Path(__file__).parent / "manifest.json"

@@ -4,7 +4,8 @@ version = "0.2.0"
 description = "yupack: 로컬 온톨로지 팩 MCP (생성·질의 완전 로컬, zip 하나로 완결)"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=1.9.0",
+    # 상한 고정 필수: mcp 2.x는 mcp.server.fastmcp 경로를 없애 import가 죽는다.
+    "mcp>=1.9.0,<2.0",
 ]
 
 [project.optional-dependencies]
