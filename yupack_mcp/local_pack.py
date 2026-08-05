@@ -523,12 +523,87 @@ class LocalPack:
                                "일반 지식/클라우드로 대체하지 마세요."}
         seeds = [nid for nid, _ in ranked[:4]]
         visited, gtrace = self.expand(seeds, 3)
-        cards = [c for c in (self.card(n) for n in list(visited)[:top_k * 5]) if c]
+        # 발견 순서(시드 -> 가까운 홉부터)로 카드화: 무작위 set 순서로 레버가 잘리는 문제 방지
+        discovery = list(seeds) + [t["to"] for t in gtrace]
+        seen_o = set()
+        ordered = [n for n in discovery if not (n in seen_o or seen_o.add(n))]
+        # 레버는 잘리지 않게 전부 뒤에 보강 (거리순 유지)
+        ordered += [n for n in ordered if False]  # noop, 가독성
+        lever_tail = [n for n in ordered if self.nodes.get(n, {}).get("space") == "lever"]
+        cards = [c for c in (self.card(n) for n in (ordered[:top_k * 5] + lever_tail)) if c]
+        dedup = set()
+        cards = [c for c in cards if not (c.get("id") in dedup or dedup.add(c.get("id")))]
         levers = [c for c in cards if c.get("kind") == "node:lever"]
         claims = [c for c in cards if c.get("kind") == "node:claim"]
         evs = [c for c in cards if c.get("kind") == "evidence"]
         # source/evidence 없는 lever는 추천으로 반환하지 않는다 (정책)
         levers = [l for l in levers if l.get("direct_evidence") or l.get("evidence_refs")]
+        # 레버 보증: grounded인데 3홉 안에 레버가 없으면, 매칭 노드에서 BFS로 가장 가까운 레버를 찾는다
+        if not levers:
+            lever_ids = {nid for nid, n in self.nodes.items() if n.get("space") == "lever"}
+            found, frontier, seen = [], list(seeds), set(seeds)
+            for hop in range(6):
+                nxt = []
+                for nid in frontier:
+                    for rel, other in self.adj.get(nid, []):
+                        if other in seen:
+                            continue
+                        seen.add(other)
+                        if other in lever_ids:
+                            found.append(other)
+                            gtrace.append({"hop": 4 + hop, "from": nid, "rel": rel,
+                                            "to": other, "note": "lever_reach"})
+                        nxt.append(other)
+                if found or not nxt:
+                    break
+                frontier = nxt
+            if not found and lever_ids:
+                # 그래프로도 못 닿으면 레버 자체를 질문과 직접 대조 (어휘+벡터 순위)
+                lv_rank = [h["id"] for h in self.lexical(question, 20) if h["id"] in lever_ids]
+                if not lv_rank:
+                    lv_rank = [h["id"] for h in self.vector(question, 20) if h["id"] in lever_ids]
+                found = lv_rank[:2]
+            levers = [c for c in (self.card(n) for n in found[:6]) if c]
+            levers = [l for l in levers if l.get("direct_evidence") or l.get("evidence_refs")]
+        # 질문-레버 전수 직접 대조 (레버는 수십 개뿐): 허브 편향 보정
+        lever_ids_all = [nid for nid, n in self.nodes.items() if n.get("space") == "lever"]
+        if lever_ids_all:
+            q_toks_l = {t for t in re.findall(r"[\w가-힣]+", question) if len(t) >= 2}
+            qv = _embed([question], model=self.embed_model)
+            qv = qv[0] if qv else None
+            row_of = {m["id"]: m["row"] for m in self.vec_meta}
+            scored_lv = []
+            for nid in lever_ids_all:
+                n = self.nodes[nid]
+                p2 = n.get("properties", {})
+                body = " ".join(str(x) for x in [n.get("label"), p2.get("label"),
+                                                  p2.get("mechanism"), p2.get("applies_when")] if x)
+                toks = {t for t in re.findall(r"[\w가-힣]+", body) if len(t) >= 2}
+                inter = sum(1 for t in toks if any(
+                    qt == t or qt.startswith(t) or t.startswith(qt) for qt in q_toks_l))
+                sc = inter * 3.0
+                if qv is not None and nid in row_of:
+                    v = struct.unpack_from(f"{self.dim}f", self.vecs, row_of[nid] * self.dim * 4)
+                    sc += sum(a * b for a, b in zip(qv, v)) * 5.0
+                scored_lv.append((sc, nid))
+            scored_lv.sort(reverse=True)
+            have = {l.get("id") for l in levers}
+            for sc, nid in scored_lv[:3]:
+                if nid not in have:
+                    c = self.card(nid)
+                    if c and (c.get("direct_evidence") or c.get("evidence_refs")):
+                        levers.append(c)
+        # 레버 재정렬: 그래프 거리보다 질문과의 의미 근접(토큰 겹침 + 벡터)이 앞선다
+        if len(levers) > 1:
+            q_toks2 = {t for t in re.findall(r"[\w가-힣]+", question) if len(t) >= 2}
+            vec_rank = {h["id"]: i for i, h in enumerate(self.vector(question, 30))}
+            def _lv_score(l):
+                body = " ".join(str(l.get(k, "")) for k in ("label", "mechanism", "applies_when"))
+                toks = {t for t in re.findall(r"[\w가-힣]+", body) if len(t) >= 2}
+                inter = sum(1 for t in toks if any(
+                    qt == t or qt.startswith(t) or t.startswith(qt) for qt in q_toks2))
+                return (inter * 3) - vec_rank.get(l.get("id"), 99) * 0.1
+            levers = sorted(levers, key=_lv_score, reverse=True)
         sources = sorted({e.get("source_id") for e in evs if e.get("source_id")})[:top_k]
         self._audit("ask", f"grounded: {question[:80]}")
         return {

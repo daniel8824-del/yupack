@@ -1,7 +1,7 @@
 {
   "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"cd \\\"$HOME/.claude/jobs/45d3e8c8/tmp/yupack-build/yupack\\\"\\nrailway run --service yupack python3 - <<'PY' 2>/dev/null\\nimport sys, types, os\\nfor n in ['mcp','mcp.server','mcp.server.fastm...",
-  "error": "Exit code 1",
-  "timestamp": "2026-07-23T11:17:07.460Z",
+  "tool_input_preview": "{\"command\":\"cd ~/yupack && python3 - <<'PY' > /tmp/lever-final.txt 2>&1\\nimport sys; sys.path.insert(0,'.')\\nfrom yupack_mcp import local_pack as lp\\npk = lp.get(lp.open_local('/Users/yedulab/Zettelka...",
+  "error": "Exit code 143\nCommand timed out after 2m 0s",
+  "timestamp": "2026-08-05T05:31:38.348Z",
   "retry_count": 1
 }
