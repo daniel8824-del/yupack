@@ -416,12 +416,19 @@ class LocalPack:
         toks = [t for t in re.findall(r"[\w가-힣]+", q) if len(t) >= 2]
         if not toks:
             return []
+        # 한국어 조사 대응: 각 토큰의 절단형(prefix*)도 함께 질의 ("프랑스혁명이" -> 프랑스혁명*)
+        terms = []
+        for t in toks[:12]:
+            terms.append(f'"{t}"')
+            for cut in (t[:-1], t[:-2]):
+                if len(cut) >= 2:
+                    terms.append(f'"{cut}" *'.replace('" *', '"*'))
         con = sqlite3.connect(p)
         try:
             rows = con.execute(
                 "SELECT id, kind, bm25(docs) FROM docs WHERE docs MATCH ? "
                 "ORDER BY bm25(docs) LIMIT ?",
-                (" OR ".join(f'"{t}"' for t in toks[:12]), k)).fetchall()
+                (" OR ".join(dict.fromkeys(terms)), k)).fetchall()
         except sqlite3.OperationalError:
             rows = []
         con.close()
@@ -510,8 +517,11 @@ class LocalPack:
         for h in lex:
             c = self.card(h["id"]) or {}
             body = " ".join(str(v) for v in c.values() if isinstance(v, str))
-            inter = q_toks & {t for t in re.findall(r"[\w가-힣]+", body) if len(t) >= 2}
-            if len(inter) >= 2 or any(len(t) >= 4 for t in inter):
+            d_toks = {t for t in re.findall(r"[\w가-힣]+", body) if len(t) >= 2}
+            # 조사 대응: 정확 일치 또는 전방일치(문서 토큰이 질문 토큰의 접두)로 겹침 판정
+            inter = {t for t in d_toks
+                     if any(qt == t or qt.startswith(t) or t.startswith(qt) for qt in q_toks)}
+            if len(inter) >= 2 or any(len(t) >= 3 for t in inter):
                 lex_strong = True
                 break
         vec_strong = bool(vec) and vec[0]["cosine"] >= thr
