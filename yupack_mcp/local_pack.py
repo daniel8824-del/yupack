@@ -21,16 +21,16 @@ import zipfile
 
 EMBED_URL = os.environ.get("YUPACK_EMBED_URL", "http://127.0.0.1:8000/v1/embeddings")
 
-# 임베딩 프로바이더: OPENAI_API_KEY 있으면 OpenAI 3-large(요건), 없으면 로컬 bge-m3 폴백
+# 임베딩 = OpenAI 강제 (Daniel 확정 2026-08-05): 로컬 모델 자동 폴백 없음.
+# 키가 없으면 임베딩을 생략하고 어휘+그래프로 동작한다 (질의는 여전히 가능).
+# bge-m3는 YUPACK_EMBED_MODEL=bge-m3 명시 때만 (OMLX 가동 필요).
 def _pick_model() -> tuple[str, int]:
     forced = os.environ.get("YUPACK_EMBED_MODEL")
     if forced == "bge-m3":
         return "bge-m3", 1024
     if forced:
-        return forced, {"text-embedding-3-large": 3072, "text-embedding-3-small": 1536}.get(forced, 1024)
-    if os.environ.get("OPENAI_API_KEY"):
-        return "text-embedding-3-small", 1536
-    return "bge-m3", 1024
+        return forced, {"text-embedding-3-large": 3072, "text-embedding-3-small": 1536}.get(forced, 1536)
+    return "text-embedding-3-small", 1536
 
 
 EMBED_MODEL, EMBED_DIM = _pick_model()
@@ -187,7 +187,7 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
                 json.dumps(m) for m in emb_meta).encode()
             emb_status = f"included({len(emb_meta)} x {EMBED_DIM}, {EMBED_MODEL}, normalized)"
         else:
-            emb_status = "unavailable(로컬 임베딩 서버 미가동): lexical+graph로 동작"
+            emb_status = "unavailable(OPENAI_API_KEY 없음): lexical+graph로 동작"
 
     # query-docs/: 레버·결정경로·정책 근거 카드 (조건·한계·검수 상태 원문 그대로)
     review_by_target = {}
