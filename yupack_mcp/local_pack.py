@@ -639,7 +639,7 @@ class LocalPack:
         vec_strong = bool(vec_all) and max(h["cosine"] for h in vec_all) >= thr
         if not ranked or not (vec_strong or lex_strong):
             self._audit("ask", f"no_local_evidence: {question[:80]}")
-            return {"status": "no_local_evidence", "local_pack_id": self.pack_id,
+            return {"status": "no_local_evidence", "answer_guide": "팩에 근거가 없습니다. 답변은 \"팩에는 근거가 없다\"부터 밝힌 뒤에만 일반 지식으로 하세요.", "local_pack_id": self.pack_id,
                     "manifest_hash": self.manifest_hash,
                     "message": "이 팩에는 질문을 뒷받침할 로컬 근거가 없습니다. "
                                "일반 지식/클라우드로 대체하지 마세요."}
@@ -731,6 +731,11 @@ class LocalPack:
         self._audit("ask", f"grounded: {question[:80]}")
         return {
             "status": "grounded",
+            "answer_guide": ("답변 작성 규칙: 후보 카드의 summary를 인용하고 relations의 관계 사슬을 "
+                              "따라 서사형으로 답하세요(단답 금지). 근거로 쓴 문장에는 근거 id를 표기하고, "
+                              "팩 밖 배경지식은 '일반 지식'으로 구분하세요. 값이 빈 보고 축(등급·검수 등)은 "
+                              "표기하지 말고 생략하세요. 답 끝에 relations의 이웃에서 이어갈 질문 1~2개를 "
+                              "제안하세요."),
             "answer_candidates": [self._rich_card(nid, sc) for nid, sc in ranked[:top_k]],
             "graph_path": gtrace[:30],
             "matched_levers": levers[:top_k],
