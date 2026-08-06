@@ -188,17 +188,27 @@ def _qa_scan(pack: str) -> dict:
             issues.append({"kind": "undeclared_relation", "id": eid,
                            "detail": f"{fn['space']}->{tn['space']}에 '{e['relation']}' 미선언"})
     orphans = [nid for nid in buf["nodes"] if nid not in linked] if buf["edges"] else list(buf["nodes"])
-    # 조언(상태에 영향 없음): 외국어 말뭉치인데 한국어 별칭이 전무하면 권고
-    labeled = [str((n.get("properties") or {}).get("label") or "") for n in buf["nodes"].values()]
-    labeled = [l for l in labeled if l]
-    hangul = sum(1 for l in labeled if re.search(r"[가-힣]", l))
-    alias_cnt = sum(1 for n in buf["nodes"].values()
-                    if (n.get("properties") or {}).get("label_ko")
-                    or (n.get("properties") or {}).get("aliases_ko"))
+    # 조언(상태에 영향 없음): 한국어 커버리지 게이지 - 한국어 질의가 목적인 팩에서는 사실상 필수
+    # 커버 판정 = 라벨에 한글이 있거나 label_ko/aliases_ko 보유
+    covered, uncovered = 0, []
+    checked = 0
+    for nid, n in buf["nodes"].items():
+        props = n.get("properties") or {}
+        label = str(props.get("label") or "")
+        if not label:
+            continue
+        checked += 1
+        if re.search(r"[가-힣]", label) or props.get("label_ko") or props.get("aliases_ko"):
+            covered += 1
+        else:
+            uncovered.append(nid)
     advisories = []
-    if len(labeled) >= 5 and hangul / len(labeled) < 0.2 and alias_cnt == 0:
-        advisories.append(f"외국어 말뭉치로 보입니다(한글 라벨 {hangul}/{len(labeled)}). "
-                          "한국어 질의 대비로 핵심 노드에 label_ko/aliases_ko 별칭을 권장합니다.")
+    korean_coverage = round(covered / checked, 3) if checked else None
+    if checked >= 5 and korean_coverage is not None and korean_coverage < 0.8:
+        advisories.append(
+            f"한국어 커버리지 {covered}/{checked} ({korean_coverage:.0%}). 한국어 질의 대상 팩이라면 "
+            "전 사건·근거 노드에 label_ko/aliases_ko(질문 동사형 포함)를 채우세요. "
+            f"미커버 예시: {uncovered[:10]}")
     kinds = {i["kind"] for i in issues}
     return {
         "status": "pass" if not issues else "fail",

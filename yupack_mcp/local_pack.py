@@ -514,10 +514,38 @@ class LocalPack:
         # 실측 캘리브레이션: bge-m3는 유근거 0.78+/무근거 0.74-, 3-large는 0.43+/0.23-
         return 0.35 if str(self.embed_model).startswith("text-embedding") else 0.76
 
+    def _translate_query_en(self, q: str) -> str | None:
+        """한글 질의를 영어로 1회 번역 (영문 말뭉치 재현율용). 키 없거나 영문 질의면 None."""
+        if not re.search(r"[가-힣]", q):
+            return None
+        if os.environ.get("YUPACK_QUERY_TRANSLATE", "on") == "off":
+            return None
+        key = os.environ.get("OPENAI_API_KEY")
+        if not key:
+            return None
+        try:
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/chat/completions",
+                json.dumps({"model": os.environ.get("YUPACK_TRANSLATE_MODEL", "gpt-4o-mini"),
+                            "temperature": 0,
+                            "messages": [{"role": "user", "content":
+                                "Translate this Korean search query into a short English search query. "
+                                "Reply with the translation only.\n" + q}]}).encode(),
+                {"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
+            d = json.load(urllib.request.urlopen(req, timeout=20))
+            t = (d["choices"][0]["message"]["content"] or "").strip()
+            return t or None
+        except Exception:
+            return None
+
     def ask(self, question: str, top_k: int = 6) -> dict:
         thr = self._cos_threshold()
         lex = self.lexical(question, 12)
         vec = self.vector(question, 12)
+        # 한·영 이중 질의: 한글 질문은 영어 번역으로도 검색해 RRF에 합류 (영문 말뭉치 재현율)
+        q_en = self._translate_query_en(question)
+        lex_en = self.lexical(q_en, 12) if q_en else []
+        vec_en = self.vector(q_en, 12) if q_en else []
         # 같은 id가 채널 안에서 두 번(노드행+근거행) 잡히면 첫 순위만 인정 (이중계상 방지)
         def _dedupe(hits):
             seen, out = set(), []
@@ -528,23 +556,26 @@ class LocalPack:
                 out.append(h)
             return out
         lex, vec = _dedupe(lex), _dedupe(vec)
-        # RRF 융합: 한 채널의 절대점수 지배를 막고 두 채널 모두에 잡힌 후보를 위로
+        lex_en, vec_en = _dedupe(lex_en), _dedupe(vec_en)
+        # RRF 융합: 한 채널의 절대점수 지배를 막고 여러 채널에 잡힌 후보를 위로
         score: dict[str, float] = {}
-        for i, h in enumerate(lex):
-            score[h["id"]] = score.get(h["id"], 0) + 1.0 / (6 + i)
-        for i, h in enumerate(vec):
-            # 순위 기여는 임계값 없이(교차언어 질의는 절대 코사인이 낮게 나옴),
-            # 임계값(thr)은 아래 근거 게이트(vec_strong) 판정에만 쓴다
-            score[h["id"]] = score.get(h["id"], 0) + 1.0 / (6 + i) + (0.05 if h["cosine"] >= thr else 0)
+        for hits in (lex, lex_en):
+            for i, h in enumerate(hits):
+                score[h["id"]] = score.get(h["id"], 0) + 1.0 / (6 + i)
+        for hits in (vec, vec_en):
+            for i, h in enumerate(hits):
+                # 순위 기여는 임계값 없이(교차언어 질의는 절대 코사인이 낮게 나옴),
+                # 임계값(thr)은 아래 근거 게이트(vec_strong) 판정에만 쓴다
+                score[h["id"]] = score.get(h["id"], 0) + 1.0 / (6 + i) + (0.05 if h["cosine"] >= thr else 0)
         ranked = sorted(score.items(), key=lambda kv: -kv[1])
         # 근거 게이트: 벡터(>=0.76) 또는 강한 어휘 일치(4자+ 토큰 정확 일치 / 2토큰 교집합)
         # 한글 1글자 단어(활·눈·신 등)는 의미어라 게이트 토큰에 포함한다
         def _gtok(s):
             return {t for t in re.findall(r"[\w가-힣]+", s)
                     if len(t) >= 2 or re.fullmatch(r"[가-힣]", t)}
-        q_toks = _gtok(question)
+        q_toks = _gtok(question) | (_gtok(q_en) if q_en else set())
         lex_strong = False
-        for h in lex:
+        for h in lex + lex_en:
             c = self.card(h["id"]) or {}
             vals = [v for v in c.values() if isinstance(v, str)]
             # 게이트는 인덱스와 같은 본문으로 판정한다: 노드 원본 속성(label_ko·aliases_ko 등) 포함
@@ -563,7 +594,8 @@ class LocalPack:
             if len(inter) >= 2 or any(len(t) >= 3 for t in inter):
                 lex_strong = True
                 break
-        vec_strong = bool(vec) and vec[0]["cosine"] >= thr
+        vec_all = vec + vec_en
+        vec_strong = bool(vec_all) and max(h["cosine"] for h in vec_all) >= thr
         if not ranked or not (vec_strong or lex_strong):
             self._audit("ask", f"no_local_evidence: {question[:80]}")
             return {"status": "no_local_evidence", "local_pack_id": self.pack_id,
