@@ -6,6 +6,7 @@ edges.jsonl + pack.yaml)을 꺼내 준다.
 """
 from __future__ import annotations
 import datetime
+import hashlib
 import io
 import json
 import os
@@ -27,7 +28,17 @@ _INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 �
 데이터 취급:
 - 모든 처리가 이 로컬 프로세스 안에서만 일어납니다. 외부로 전송하지 않습니다.
 - 쓰기는 로컬 팩 버퍼와 로컬 SQLite에만 갑니다. 외부 프로덕션 DB에는 쓰지 않습니다(읽기 전용 조회만).
-- 네트워크 호출이 없으므로 노트 본문·팩 내용이 외부 API로 나갈 일이 없습니다."""
+- 네트워크 호출이 없으므로 노트 본문·팩 내용이 외부 API로 나갈 일이 없습니다.
+
+온톨로지 그래머(중요 — 위반은 입력 시점에 거부됩니다):
+- 노드 타입과 관계는 ontology_manifest의 그래머로 강제됩니다. 선언되지 않은 노드 타입,
+  공간이 틀린 타입(예: evidence 공간의 Claim), 선언되지 않은 공간 쌍의 관계는 거부됩니다.
+- 도메인 전용 명사(예: 손실회피, 넛지)나 새 관계가 필요하면 **schema_declare로 먼저 선언**한
+  뒤 사용하세요. 미리 정의된 묶음은 schema_pack_install(saas/biomedical/legal/finance)로 설치합니다.
+- ontology_ingest의 source_id는 출처 표시입니다. 텍스트 노드 ID로 쓰이지 않으며(자동 text: ID 발급),
+  출처 노드가 있으면 contains 엣지가 자동 연결됩니다.
+- 저장 전 pack_qa로 팩 전체를 검사하세요. pack_save는 qa 리포트와 표준 계약 파일
+  (manifest.json, graph/, evidence/, quality/, neo4j/import.cypher)을 zip에 동봉합니다."""
 
 mcp = FastMCP("yupack", instructions=_INSTRUCTIONS,
               transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
@@ -99,6 +110,168 @@ def _allowed_relations(from_space: str | None, to_space: str | None) -> list[str
         if me["from_space"] == from_space and me["to_space"] == to_space:
             return me["relations"]
     return None
+
+
+def _allowed_types_for(buf: dict, space: str) -> list[str]:
+    """공간별 허용 노드 타입 = 기본 그래머 + 설치 스키마팩(공간 자유) + 팩 커스텀 선언."""
+    types = list(MANIFEST["spaces"].get(space, {}).get("node_types", []))
+    types += buf.get("custom_types", {}).get(space, [])
+    for sp in buf.get("schema_packs", []):
+        types += MANIFEST["schema_packs"].get(sp, [])
+    return types
+
+
+def _edge_relations(buf: dict, from_space: str, to_space: str) -> list[str] | None:
+    """공간 쌍의 허용 관계(기본 meta_edges + 팩 커스텀 선언). 쌍 자체가 미선언이면 None."""
+    rels, declared = [], False
+    for me in MANIFEST["meta_edges"] + buf.get("custom_relations", []):
+        if me["from_space"] == from_space and me["to_space"] == to_space:
+            rels += me["relations"]
+            declared = True
+    return rels if declared else None
+
+
+def _qa_scan(pack: str) -> dict:
+    """팩 전체를 그래머로 검사한다. opencrab-pack-v1 quality/report.json 형태로 반환."""
+    buf = _get_pack(pack)
+    issues = []
+    for nid, n in buf["nodes"].items():
+        if n["space"] not in MANIFEST["spaces"]:
+            issues.append({"kind": "unknown_space", "id": nid, "detail": n["space"]})
+            continue
+        if n["node_type"] not in _allowed_types_for(buf, n["space"]):
+            issues.append({"kind": "undeclared_node_type", "id": nid,
+                           "detail": f"{n['space']}/{n['node_type']}"})
+        canonical = _space_of(n["node_type"])
+        if canonical and canonical != n["space"]:
+            issues.append({"kind": "wrong_space", "id": nid,
+                           "detail": f"{n['node_type']}의 정본 공간은 '{canonical}' (현재 '{n['space']}')"})
+    linked = set()
+    broken_edges = 0
+    for i, e in enumerate(buf["edges"]):
+        fn, tn = buf["nodes"].get(e["from_id"]), buf["nodes"].get(e["to_id"])
+        eid = f"edge#{i}({e['from_id']}-{e['relation']}->{e['to_id']})"
+        if not fn or not tn:
+            issues.append({"kind": "broken_edge", "id": eid,
+                           "detail": "끝점 노드가 팩에 없음"})
+            broken_edges += 1
+            continue
+        linked.update((e["from_id"], e["to_id"]))
+        if fn["space"] != e["from_space"] or tn["space"] != e["to_space"]:
+            issues.append({"kind": "space_mismatch", "id": eid,
+                           "detail": f"실제 공간 {fn['space']}->{tn['space']}, 기록 {e['from_space']}->{e['to_space']}"})
+        allowed = _edge_relations(buf, fn["space"], tn["space"])
+        if allowed is None or e["relation"] not in allowed:
+            issues.append({"kind": "undeclared_relation", "id": eid,
+                           "detail": f"{fn['space']}->{tn['space']}에 '{e['relation']}' 미선언"})
+    orphans = [nid for nid in buf["nodes"] if nid not in linked] if buf["edges"] else list(buf["nodes"])
+    kinds = {i["kind"] for i in issues}
+    return {
+        "status": "pass" if not issues else "fail",
+        "checks": {
+            "grammar": "fail" if kinds & {"undeclared_node_type", "undeclared_relation", "unknown_space"} else "pass",
+            "schema": "fail" if "wrong_space" in kinds else "pass",
+            "broken_edges": "fail" if broken_edges else "pass",
+            "orphan_nodes": "warn" if orphans else "pass",
+        },
+        "counts": {"nodes": len(buf["nodes"]), "edges": len(buf["edges"]),
+                   "issues": len(issues), "broken_edges": broken_edges,
+                   "orphan_nodes": len(orphans)},
+        "orphan_node_ids": orphans[:50],
+        "issues": issues,
+    }
+
+
+def _cy(v) -> str:
+    """Cypher 문자열 리터럴 (json 이스케이프는 Cypher와 호환)."""
+    return json.dumps(str(v), ensure_ascii=False)
+
+
+def _contract_files(pack: str, buf: dict, today: str, qa: dict) -> dict[str, str]:
+    """opencrab-pack-v1 계약 아티팩트를 생성한다: manifest.json + graph/ + evidence/ +
+    quality/ + neo4j/import.cypher. (opencrab_ingest.jsonl은 Neo4j 통과 후 추출본이라
+    Neo4j 미접촉인 yupack에서는 만들지 않는다 — yucrates export 몫.)"""
+    ev_refs: dict[str, list] = {}   # node_id -> 연결된 evidence 노드 id들
+    ev_links: dict[str, list] = {}  # evidence_id -> 연결된 비evidence 노드 id들
+    for e in buf["edges"]:
+        for a, b in ((e["from_id"], e["to_id"]), (e["to_id"], e["from_id"])):
+            na, nb = buf["nodes"].get(a), buf["nodes"].get(b)
+            if na and nb and nb["space"] == "evidence" and na["space"] != "evidence":
+                ev_refs.setdefault(a, []).append(b)
+                ev_links.setdefault(b, []).append(a)
+    nodes_l, edges_l, evidence_l, cypher = [], [], [], []
+    for nid, n in buf["nodes"].items():
+        props = n.get("properties", {})
+        nodes_l.append(json.dumps({
+            "id": nid, "label": props.get("label", nid), "space": n["space"],
+            "node_type": n["node_type"], "properties": props,
+            "evidence_refs": ev_refs.get(nid, []),
+            "quality": {"confidence": props.get("confidence"), "promotion_status": "draft"},
+        }, ensure_ascii=False))
+        safe_type = re.sub(r"[^0-9A-Za-z_가-힣]", "_", n["node_type"])
+        cypher.append(f"MERGE (n:`{safe_type}` {{id: {_cy(nid)}}}) "
+                      f"SET n.label = {_cy(props.get('label', nid))}, n.space = {_cy(n['space'])}, "
+                      f"n.node_type = {_cy(n['node_type'])}, n.props_json = {_cy(json.dumps(props, ensure_ascii=False))};")
+        if n["space"] == "evidence":
+            evidence_l.append(json.dumps({
+                "evidence_id": nid, "kind": "text_chunk",
+                "source": {"url": None, "path": None, "title": props.get("source_id") or props.get("label")},
+                "hash": "sha256:" + hashlib.sha256(
+                    (props.get("text") or props.get("definition") or "").encode()).hexdigest(),
+                "collected_at": today,
+                "location": {"document_id": props.get("source_id"), "chunk_index": None},
+                "links": {"document_id": props.get("source_id"),
+                          "node_ids": sorted(set(ev_links.get(nid, [])))},
+            }, ensure_ascii=False))
+    for i, e in enumerate(buf["edges"]):
+        edges_l.append(json.dumps({
+            "id": f"edge:{i}", "from_id": e["from_id"], "to_id": e["to_id"],
+            "from_space": e["from_space"], "to_space": e["to_space"], "relation": e["relation"],
+            "confidence": e.get("properties", {}).get("confidence"),
+            "evidence_refs": sorted(set(ev_refs.get(e["from_id"], []) + ev_refs.get(e["to_id"], []))),
+            "properties": e.get("properties", {}),
+        }, ensure_ascii=False))
+        safe_rel = re.sub(r"[^0-9A-Za-z_]", "_", e["relation"])
+        cypher.append(f"MATCH (a {{id: {_cy(e['from_id'])}}}), (b {{id: {_cy(e['to_id'])}}}) "
+                      f"MERGE (a)-[r:`{safe_rel}`]->(b) "
+                      f"SET r.props_json = {_cy(json.dumps(e.get('properties', {}), ensure_ascii=False))};")
+    nodes_txt, edges_txt, ev_txt = "\n".join(nodes_l), "\n".join(edges_l), "\n".join(evidence_l)
+    non_ev = [nid for nid, n in buf["nodes"].items() if n["space"] != "evidence"]
+    manifest = {
+        "format_version": "opencrab-pack-v1",
+        "pack_id": f"{_safe_filename(pack)}-{today}", "title": pack, "version": "1.0.0",
+        "grammar_version": MANIFEST["version"], "created_at": today, "created_by": "yupack",
+        "license": {"scope": "personal", "name": "proprietary"},
+        "source": {"mode": "manual", "label": pack, "url": None,
+                   "description": "yupack 로컬 공방에서 수동/대화형으로 생산된 팩"},
+        "schema_packs": buf.get("schema_packs", []),
+        "custom_grammar": {"node_types": buf.get("custom_types", {}),
+                           "relations": buf.get("custom_relations", [])},
+        "counts": {"nodes": len(buf["nodes"]), "edges": len(buf["edges"]),
+                   "evidence": len(evidence_l), "documents": 0, "files": 0},
+        "quality": {
+            "evidence_coverage": (sum(1 for nid in non_ev if ev_refs.get(nid)) / len(non_ev)) if non_ev else None,
+            "graph_reference_integrity":
+                1.0 - (qa["counts"]["broken_edges"] / len(buf["edges"]) if buf["edges"] else 0.0),
+            "promotion_status": "validated" if qa["status"] == "pass" else "draft",
+        },
+        "hashes": {"nodes_sha256": hashlib.sha256(nodes_txt.encode()).hexdigest(),
+                   "edges_sha256": hashlib.sha256(edges_txt.encode()).hexdigest(),
+                   "evidence_sha256": hashlib.sha256(ev_txt.encode()).hexdigest()},
+        "artifacts": {"nodes": "graph/nodes.jsonl", "edges": "graph/edges.jsonl",
+                      "evidence_index": "evidence/index.jsonl",
+                      "quality_report": "quality/report.json",
+                      "neo4j_cypher": "neo4j/import.cypher"},
+    }
+    return {
+        "manifest.json": json.dumps(manifest, ensure_ascii=False, indent=1),
+        "graph/nodes.jsonl": nodes_txt,
+        "graph/edges.jsonl": edges_txt,
+        "evidence/index.jsonl": ev_txt,
+        "quality/report.json": json.dumps(qa, ensure_ascii=False, indent=1),
+        "neo4j/import.cypher": "// yupack pack: " + pack + " (" + today + ")\n"
+                               "// 로컬 재현용. graph/*.jsonl이 정본이다.\n" + "\n".join(cypher) + "\n",
+    }
 
 
 def _store_zip(files: dict) -> str:
@@ -254,6 +427,56 @@ def schema_pack_uninstall(name: str, pack: str = DEFAULT_PACK) -> dict:
 
 
 @mcp.tool()
+def schema_declare(pack: str = DEFAULT_PACK, node_types: dict | None = None,
+                   relations: list | None = None) -> dict:
+    """팩 전용 커스텀 그래머를 선언한다 (이 팩에서만 유효, SQLite에 영속).
+
+    node_types: {"공간": ["타입", ...]} — 예: {"concept": ["BehavioralBias", "Nudge"], "resource": ["Source"]}
+    relations: [{"from_space": "claim", "to_space": "concept", "relations": ["about"]}]
+    선언 후 ontology_add_node / ontology_add_edge가 이 타입·관계를 허용한다.
+    도메인 명사가 필요할 때 임의 타입을 그냥 넣지 말고 반드시 여기로 먼저 선언할 것.
+    """
+    buf = _get_pack(pack)
+    added_types: dict[str, list] = {}
+    added_relations = []
+    for space, tlist in (node_types or {}).items():
+        if space not in MANIFEST["spaces"]:
+            return {"error": f"알 수 없는 space: {space}. 사용 가능: {list(MANIFEST['spaces'])}"}
+        cur = buf.setdefault("custom_types", {}).setdefault(space, [])
+        for t in tlist:
+            canonical = _space_of(t)
+            if canonical and canonical != space:
+                return {"error": f"'{t}'는 기본 그래머에서 '{canonical}' 공간 소속입니다. 재선언 불가."}
+            if t not in cur:
+                cur.append(t)
+                added_types.setdefault(space, []).append(t)
+    for r in relations or []:
+        fs, ts = r.get("from_space"), r.get("to_space")
+        rels = list(r.get("relations", []))
+        if fs not in MANIFEST["spaces"] or ts not in MANIFEST["spaces"]:
+            return {"error": f"알 수 없는 space 쌍: {fs}→{ts}. 사용 가능: {list(MANIFEST['spaces'])}"}
+        if not rels:
+            return {"error": f"{fs}→{ts}: relations 목록이 비어 있습니다."}
+        buf.setdefault("custom_relations", []).append(
+            {"from_space": fs, "to_space": ts, "relations": rels})
+        added_relations.append({"from_space": fs, "to_space": ts, "relations": rels})
+    return {"declared": {"node_types": added_types, "relations": added_relations},
+            "now_custom": {"node_types": buf.get("custom_types", {}),
+                           "relations": buf.get("custom_relations", [])},
+            "stores": {"buffer": "ok", "sqlite": _persist(pack)}}
+
+
+@mcp.tool()
+def pack_qa(pack: str = DEFAULT_PACK) -> dict:
+    """팩 전체를 그래머로 검사해 pass/fail과 위반 목록을 반환한다 (저장 전 필수 점검).
+
+    검사 항목: 비선언 노드 타입, 정본 공간 오배치, 끊어진 엣지(끝점 부재),
+    엣지 공간 불일치, 비선언 관계, 고아 노드. pack_save가 이 리포트를 zip에 동봉한다.
+    """
+    return _qa_scan(pack)
+
+
+@mcp.tool()
 def ontology_extract(text: str, pack: str = DEFAULT_PACK, max_nodes: int = 8) -> dict:
     """텍스트에서 개념 노드와 관계를 LLM으로 추출해 팩 버퍼에 넣는다 (DB 쓰기 없음)."""
     key = os.environ.get("OPENAI_API_KEY")
@@ -344,11 +567,30 @@ def ontology_lever_simulate(lever_id: str, pack: str = DEFAULT_PACK) -> dict:
 @mcp.tool()
 def ontology_add_node(space: str, node_type: str, node_id: str,
                        properties: dict | None = None, pack: str = DEFAULT_PACK) -> dict:
-    """노드 하나를 현재 팩의 인메모리 버퍼에만 추가한다 (외부 DB 쓰기 없음)."""
+    """노드 하나를 팩 버퍼에 추가한다 (외부 DB 쓰기 없음). 그래머 위반은 즉시 거부한다.
+
+    비선언 타입이 필요하면 schema_declare로 먼저 선언하거나 schema_pack_install을 사용.
+    같은 id에 같은 space/type이면 갱신, 다른 space/type이면 덮어쓰지 않고 거부한다.
+    """
     if space not in MANIFEST["spaces"]:
         return {"error": f"알 수 없는 space: {space}. 사용 가능: {list(MANIFEST['spaces'])}"}
+    buf = _get_pack(pack)
+    canonical = _space_of(node_type)
+    if canonical and canonical != space:
+        return {"error": f"'{node_type}'의 정본 공간은 '{canonical}'입니다. space='{canonical}'로 추가하세요.",
+                "hint": f"예: Claim은 claim 공간, TextUnit은 evidence 공간 소속입니다."}
+    if node_type not in _allowed_types_for(buf, space):
+        return {"error": f"'{space}' 공간에 선언되지 않은 노드 타입: {node_type}",
+                "declared_types": MANIFEST["spaces"][space]["node_types"],
+                "custom_types": buf.get("custom_types", {}).get(space, []),
+                "hint": "커스텀 타입은 schema_declare(node_types={\"" + space + "\": [\"" + node_type + "\"]})로 "
+                        "먼저 선언한 뒤 추가하세요. 도메인 묶음은 schema_pack_install 참고."}
+    existing = buf["nodes"].get(node_id)
+    if existing and (existing["space"] != space or existing["node_type"] != node_type):
+        return {"error": f"id 충돌: '{node_id}'는 이미 {existing['space']}/{existing['node_type']} 노드입니다. "
+                          "기존 노드를 덮어쓰지 않습니다. 다른 id를 사용하세요."}
     node_data = {"space": space, "node_type": node_type, "properties": properties or {}}
-    _get_pack(pack)["nodes"][node_id] = node_data
+    buf["nodes"][node_id] = node_data
     return {"stores": {"buffer": "ok", "sqlite": _persist(pack)}, "node_data": {node_id: node_data}}
 
 
@@ -356,25 +598,69 @@ def ontology_add_node(space: str, node_type: str, node_id: str,
 def ontology_add_edge(from_space: str, from_id: str, relation: str, to_space: str,
                        to_id: str, properties: dict | None = None,
                        pack: str = DEFAULT_PACK) -> dict:
-    """엣지 하나를 현재 팩의 인메모리 버퍼에만 추가한다. 정의된 관계인지 그래머로 검증한다."""
-    allowed = _allowed_relations(from_space, to_space)
-    if allowed is not None and relation not in allowed:
+    """엣지 하나를 팩 버퍼에 추가한다. 그래머(끝점 실존·실제 공간·허용 관계)를 강제한다.
+
+    끝점 노드가 팩에 먼저 있어야 하고, 선언된 공간 쌍·관계만 허용된다.
+    새 관계가 필요하면 schema_declare(relations=[...])로 먼저 선언한다.
+    """
+    buf = _get_pack(pack)
+    for side, sid, sspace in (("from", from_id, from_space), ("to", to_id, to_space)):
+        n = buf["nodes"].get(sid)
+        if not n:
+            return {"error": f"{side} 노드가 팩에 없습니다: '{sid}'. ontology_add_node로 먼저 추가하세요."}
+        if n["space"] != sspace:
+            return {"error": f"{side} 노드 '{sid}'의 실제 공간은 '{n['space']}'입니다 ('{sspace}' 아님). "
+                              f"{side}_space='{n['space']}'로 다시 시도하세요."}
+    allowed = _edge_relations(buf, from_space, to_space)
+    if allowed is None:
+        pairs = sorted({(me["from_space"], me["to_space"])
+                        for me in MANIFEST["meta_edges"] + buf.get("custom_relations", [])
+                        if me["from_space"] == from_space})
+        return {"error": f"'{from_space}'→'{to_space}' 공간 쌍에 선언된 관계가 없습니다.",
+                "declared_pairs_from_here": [f"{a}→{b}" for a, b in pairs],
+                "hint": "schema_declare(relations=[{\"from_space\": \"" + from_space + "\", \"to_space\": \""
+                        + to_space + "\", \"relations\": [\"" + relation + "\"]}])로 먼저 선언하세요."}
+    if relation not in allowed:
         return {"error": f"'{from_space}'→'{to_space}' 간 허용되지 않은 관계: {relation}. "
                           f"허용된 관계: {allowed}"}
     edge = {"from_space": from_space, "from_id": from_id, "relation": relation,
             "to_space": to_space, "to_id": to_id, "properties": properties or {}}
-    _get_pack(pack)["edges"].append(edge)
+    buf["edges"].append(edge)
     return {"stores": {"buffer": "ok", "sqlite": _persist(pack)}, "edge": edge}
 
 
 @mcp.tool()
 def ontology_ingest(text: str, source_id: str | None = None, pack: str = DEFAULT_PACK) -> dict:
-    """텍스트를 evidence 공간의 TextUnit 노드 하나로 버퍼에 저장한다 (단순 분할, DB 쓰기 없음)."""
-    node_id = source_id or f"text:{secrets.token_hex(4)}"
-    node_data = {"space": "evidence", "node_type": "TextUnit",
-                 "properties": {"text": text, "label": node_id}}
-    _get_pack(pack)["nodes"][node_id] = node_data
-    return {"stores": {"buffer": "ok", "sqlite": _persist(pack)}, "node_data": {node_id: node_data}}
+    """텍스트를 evidence 공간의 TextUnit 노드로 버퍼에 저장한다 (DB 쓰기 없음).
+
+    source_id는 출처 표시(provenance)다: TextUnit의 ID로 쓰이지 않고 속성에 기록되며,
+    해당 출처 노드가 resource 공간에 있으면 contains 엣지가 자동 연결된다.
+    (과거에는 source_id를 노드 ID로 써서 원본 Source 노드를 덮어쓰는 버그가 있었다.)
+    """
+    buf = _get_pack(pack)
+    node_id = f"text:{secrets.token_hex(4)}"
+    while node_id in buf["nodes"]:
+        node_id = f"text:{secrets.token_hex(4)}"
+    props = {"text": text, "label": node_id}
+    provenance = None
+    if source_id:
+        props["source_id"] = source_id
+        src = buf["nodes"].get(source_id)
+        if src and src["space"] == "resource":
+            buf["edges"].append({"from_space": "resource", "from_id": source_id,
+                                 "relation": "contains", "to_space": "evidence",
+                                 "to_id": node_id, "properties": {}})
+            provenance = f"{source_id} -contains-> {node_id}"
+        elif src:
+            provenance = f"출처 '{source_id}'는 {src['space']} 공간이라 contains 엣지 미생성 (속성으로만 기록)"
+        else:
+            provenance = f"출처 노드 '{source_id}'가 팩에 없어 속성으로만 기록 (필요시 resource 노드로 추가)"
+    node_data = {"space": "evidence", "node_type": "TextUnit", "properties": props}
+    buf["nodes"][node_id] = node_data
+    out = {"stores": {"buffer": "ok", "sqlite": _persist(pack)}, "node_data": {node_id: node_data}}
+    if provenance:
+        out["provenance"] = provenance
+    return out
 
 
 @mcp.tool()
@@ -735,6 +1021,8 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
                  f"title: \"{pack}\"\nversion: 1.0.0\ncreated: {today}\n"
                  f"manifest_version: \"{MANIFEST['version']}\"\n"
                  f"schema_packs: {json.dumps(buf['schema_packs'], ensure_ascii=False)}\n"
+                 f"custom_node_types: {json.dumps(buf.get('custom_types', {}), ensure_ascii=False)}\n"
+                 f"custom_relations: {json.dumps(buf.get('custom_relations', []), ensure_ascii=False)}\n"
                  f"storage: \"local zip only, production DB 미접촉\"\n")
 
     with _tf.TemporaryDirectory() as td:
@@ -750,8 +1038,12 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
         r = local_pack.build_queryable(src, out, include_embeddings)
         if "error" in r:
             return r
-        # 3) notes/ md 부속 추가 (옵시디언용)
+        # 3) notes/ md 부속 + opencrab-pack-v1 계약 아티팩트 추가
+        qa = _qa_scan(pack)
+        contract = _contract_files(pack, buf, today, qa)
         with zipfile.ZipFile(out, "a", zipfile.ZIP_DEFLATED) as z:
+            for name, content in contract.items():
+                z.writestr(name, content)
             for nid, n in buf["nodes"].items():
                 props = n.get("properties", {})
                 label = props.get("label", nid)
@@ -761,7 +1053,12 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
         data = open(out, "rb").read()
 
     result = {"structure": r["files"] if isinstance(r.get("files"), list) else None,
-              "counts": r["counts"], "embeddings": r["embeddings"]}
+              "counts": r["counts"], "embeddings": r["embeddings"],
+              "contract_files": list(contract.keys()),
+              "qa_status": qa["status"], "qa_issues": qa["counts"]["issues"]}
+    if qa["status"] != "pass":
+        result["qa_warning"] = ("팩에 그래머 위반이 있습니다. quality/report.json 참조. "
+                                "pack_qa로 확인 후 수정하고 다시 저장하는 것을 권장합니다.")
     is_server = bool(os.environ.get("RAILWAY_PUBLIC_DOMAIN"))
     # 로컬 모드에서 저장 경로 미지정 -> 저장하지 않고 사용자에게 경로를 묻게 한다
     if not save_to and not is_server:
