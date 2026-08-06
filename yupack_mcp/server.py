@@ -38,7 +38,10 @@ _INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 �
 - ontology_ingest의 source_id는 출처 표시입니다. 텍스트 노드 ID로 쓰이지 않으며(자동 text: ID 발급),
   출처 노드가 있으면 contains 엣지가 자동 연결됩니다.
 - 저장 전 pack_qa로 팩 전체를 검사하세요. pack_save는 qa 리포트와 표준 계약 파일
-  (manifest.json, graph/, evidence/, quality/, neo4j/import.cypher)을 zip에 동봉합니다."""
+  (manifest.json, graph/, evidence/, quality/, neo4j/import.cypher)을 zip에 동봉합니다.
+- 저장된 팩을 이어서 편집하려면 pack_open_local(zip_path, mode="authoring")로 여세요.
+  반환된 authoring_pack 이름으로 add_node/pack_qa/pack_save가 이어집니다.
+  (읽기 핸들 pack_xxxx는 질의 전용이며 저작 버퍼가 아닙니다.)"""
 
 mcp = FastMCP("yupack", instructions=_INSTRUCTIONS,
               transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
@@ -59,8 +62,23 @@ _PRIVATE_PREFIXES = ("personal:", "zzdemo:", "class:test:")
 
 # ----------------------- SQLite 영속화 (로컬 DB, 프로덕션 DB 아님) -----------------------
 # ponytail: 팩 단위 JSON blob upsert. 수업/개인 규모용. 대량 배치는 build 스크립트 영역.
-_DB_PATH = os.environ.get("YUPACK_DB") or (
-    "/data/yupack.db" if os.path.isdir("/data") else str(Path(__file__).parent / "yupack.db"))
+def _default_db_path() -> str:
+    """기본 DB 위치. 패키지 폴더는 uvx 캐시라 갱신 시 날아가므로 홈의 안정 경로를 쓴다."""
+    if os.path.isdir("/data"):
+        return "/data/yupack.db"
+    stable = Path.home() / ".yupack" / "yupack.db"
+    stable.parent.mkdir(parents=True, exist_ok=True)
+    legacy = Path(__file__).parent / "yupack.db"
+    if legacy.exists() and not stable.exists():
+        import shutil
+        try:
+            shutil.copy2(legacy, stable)  # 구버전 DB 1회 이관
+        except Exception:
+            pass
+    return str(stable)
+
+
+_DB_PATH = os.environ.get("YUPACK_DB") or _default_db_path()
 
 
 def _db():
@@ -840,14 +858,88 @@ def pack_build_queryable(source_zip: str, out_zip: str | None = None,
     return local_pack.build_queryable(source_zip, out_zip, include_embeddings)
 
 
+def _hydrate_from_zip(zip_path: str, pack: str | None = None) -> dict:
+    """저장된 팩 zip의 정본(nodes/edges + 커스텀 그래머)을 저작 버퍼(PACKS)로 복원한다."""
+    z = zipfile.ZipFile(os.path.expanduser(zip_path))
+    names = set(z.namelist())
+    meta: dict[str, str] = {}
+    if "pack.yaml" in names:
+        for ln in z.read("pack.yaml").decode("utf-8", errors="ignore").splitlines():
+            if ": " in ln:
+                k, v = ln.split(": ", 1)
+                meta[k.strip()] = v.strip()
+    pack = pack or meta.get("title", "").strip('"') or \
+        os.path.splitext(os.path.basename(zip_path))[0]
+    buf = _get_pack(pack)
+    if buf["nodes"]:
+        return {"error": f"저작 버퍼 '{pack}'에 이미 노드 {len(buf['nodes'])}개가 있습니다. "
+                          "덮어쓰지 않습니다. pack 파라미터로 다른 이름을 지정하세요."}
+    for key, target in (("custom_node_types", "custom_types"), ("custom_relations", "custom_relations")):
+        if key in meta:
+            try:
+                buf[target] = json.loads(meta[key])
+            except Exception:
+                pass
+    if "schema_packs" in meta:
+        try:
+            buf["schema_packs"] = [p for p in json.loads(meta["schema_packs"])
+                                    if p in MANIFEST["schema_packs"]]
+        except Exception:
+            pass
+    nodes_file = "graph/nodes.jsonl" if "graph/nodes.jsonl" in names else "nodes.jsonl"
+    edges_file = "graph/edges.jsonl" if "graph/edges.jsonl" in names else "edges.jsonl"
+    for ln in z.read(nodes_file).decode("utf-8", errors="ignore").splitlines():
+        if not ln.strip():
+            continue
+        n = json.loads(ln)
+        props = n.get("properties") or {}
+        if n.get("label") and "label" not in props:
+            props["label"] = n["label"]
+        buf["nodes"][n["id"]] = {"space": n["space"], "node_type": n["node_type"],
+                                  "properties": props}
+    for ln in z.read(edges_file).decode("utf-8", errors="ignore").splitlines():
+        if not ln.strip():
+            continue
+        e = json.loads(ln)
+        fid = e.get("from_id") or e.get("source")
+        tid = e.get("to_id") or e.get("target")
+        buf["edges"].append({
+            "from_space": e.get("from_space") or buf["nodes"].get(fid, {}).get("space"),
+            "from_id": fid, "relation": e["relation"],
+            "to_space": e.get("to_space") or buf["nodes"].get(tid, {}).get("space"),
+            "to_id": tid, "properties": e.get("properties") or {}})
+    _persist(pack)
+    return {"authoring_pack": pack,
+            "counts": {"nodes": len(buf["nodes"]), "edges": len(buf["edges"])},
+            "custom_grammar": {"node_types": buf.get("custom_types", {}),
+                                "relations": buf.get("custom_relations", [])},
+            "schema_packs": buf["schema_packs"]}
+
+
 @mcp.tool()
 def pack_open_local(zip_path: str, mode: str = "read_only") -> dict:
-    """로컬 zip 팩을 열고 manifest.lock으로 무결성을 검증한다. pack_handle을 반환한다."""
+    """로컬 zip 팩을 열고 manifest.lock으로 무결성을 검증한다. pack_handle을 반환한다.
+
+    mode="read_only"(기본): 질의 전용 핸들만 연다.
+    mode="authoring": 핸들과 함께 zip의 정본을 저작 버퍼로 복원한다. 이후
+      ontology_add_node/pack_qa/pack_save를 반환된 authoring_pack 이름으로 호출하면
+      이어서 편집·검사·재저장할 수 있다. (핸들 id는 저작 버퍼가 아니다 - 혼용 금지)
+    """
     from . import local_pack
     try:
-        return local_pack.open_local(zip_path, mode)
+        r = local_pack.open_local(zip_path, "read_only")
     except Exception as e:
         return {"error": f"열기 실패: {e}"}
+    if mode == "authoring" and isinstance(r, dict) and "error" not in r:
+        h = _hydrate_from_zip(zip_path)
+        if "error" in h:
+            r["authoring"] = h
+        else:
+            r["authoring_pack"] = h["authoring_pack"]
+            r["authoring_counts"] = h["counts"]
+            r["hint"] = (f"이어서 편집하려면 pack=\"{h['authoring_pack']}\"로 "
+                         "ontology_add_node/pack_qa/pack_save를 호출하세요.")
+    return r
 
 
 @mcp.tool()
