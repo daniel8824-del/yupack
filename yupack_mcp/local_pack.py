@@ -510,16 +510,26 @@ class LocalPack:
 
     def ask(self, question: str, top_k: int = 6) -> dict:
         thr = self._cos_threshold()
-        lex = self.lexical(question, 8)
-        vec = self.vector(question, 8)
+        lex = self.lexical(question, 12)
+        vec = self.vector(question, 12)
+        # 같은 id가 채널 안에서 두 번(노드행+근거행) 잡히면 첫 순위만 인정 (이중계상 방지)
+        def _dedupe(hits):
+            seen, out = set(), []
+            for h in hits:
+                if h["id"] in seen:
+                    continue
+                seen.add(h["id"])
+                out.append(h)
+            return out
+        lex, vec = _dedupe(lex), _dedupe(vec)
+        # RRF 융합: 한 채널의 절대점수 지배를 막고 두 채널 모두에 잡힌 후보를 위로
         score: dict[str, float] = {}
         for i, h in enumerate(lex):
-            score[h["id"]] = score.get(h["id"], 0) + (8 - i)
+            score[h["id"]] = score.get(h["id"], 0) + 1.0 / (6 + i)
         for i, h in enumerate(vec):
             # 순위 기여는 임계값 없이(교차언어 질의는 절대 코사인이 낮게 나옴),
             # 임계값(thr)은 아래 근거 게이트(vec_strong) 판정에만 쓴다
-            bonus = (8 - i) + (2 if h["cosine"] >= thr else 0)
-            score[h["id"]] = score.get(h["id"], 0) + bonus
+            score[h["id"]] = score.get(h["id"], 0) + 1.0 / (6 + i) + (0.05 if h["cosine"] >= thr else 0)
         ranked = sorted(score.items(), key=lambda kv: -kv[1])
         # 근거 게이트: 벡터(>=0.76) 또는 강한 어휘 일치(4자+ 토큰 정확 일치 / 2토큰 교집합)
         # 한글 1글자 단어(활·눈·신 등)는 의미어라 게이트 토큰에 포함한다
