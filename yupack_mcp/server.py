@@ -137,6 +137,13 @@ def _get_pack(pack: str) -> dict:
 _load_packs()
 
 
+def _read_only_block() -> dict | None:
+    """YUPACK_READ_ONLY=1 이면 저작·변경 도구를 잠근다 (전용 질의 플러그인 배포용)."""
+    if os.environ.get("YUPACK_READ_ONLY") == "1":
+        return {"error": "이 플러그인은 읽기 전용(질의 전용)입니다. 저작은 일반 yupack 플러그인에서 하세요."}
+    return None
+
+
 def _space_of(node_type: str) -> str | None:
     for space, info in MANIFEST["spaces"].items():
         if node_type in info["node_types"]:
@@ -470,6 +477,9 @@ def schema_pack_list(pack: str = DEFAULT_PACK) -> dict:
 @mcp.tool()
 def schema_pack_install(name: str, pack: str = DEFAULT_PACK) -> dict:
     """스키마팩(saas/biomedical/legal 등)을 현재 팩 버퍼에 설치해 노드 타입을 늘린다."""
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
     if name not in MANIFEST["schema_packs"]:
         return {"error": f"알 수 없는 스키마팩: {name}. 사용 가능: {list(MANIFEST['schema_packs'])}"}
     buf = _get_pack(pack)
@@ -481,6 +491,9 @@ def schema_pack_install(name: str, pack: str = DEFAULT_PACK) -> dict:
 @mcp.tool()
 def schema_pack_uninstall(name: str, pack: str = DEFAULT_PACK) -> dict:
     """현재 팩 버퍼에서 스키마팩을 제거한다 (노드는 남고, 타입 확장만 해제)."""
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
     buf = _get_pack(pack)
     if name not in buf["schema_packs"]:
         return {"error": f"설치되어 있지 않음: {name}. 현재: {buf['schema_packs']}"}
@@ -499,6 +512,9 @@ def schema_declare(pack: str = DEFAULT_PACK, node_types: dict | None = None,
     선언 후 ontology_add_node / ontology_add_edge가 이 타입·관계를 허용한다.
     도메인 명사가 필요할 때 임의 타입을 그냥 넣지 말고 반드시 여기로 먼저 선언할 것.
     """
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
     buf = _get_pack(pack)
     added_types: dict[str, list] = {}
     added_relations = []
@@ -553,6 +569,9 @@ def ontology_extract(text: str, pack: str = DEFAULT_PACK, max_nodes: int = 8) ->
     추출 관계는 그래머의 concept→concept 허용 목록(커스텀 선언 포함)으로 제한되고,
     삽입 시에도 같은 그래머로 검증한다. 허용 밖 관계·타입 충돌 노드는 건너뛰고 보고한다.
     """
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
         return {"error": "OPENAI_API_KEY 없음: extract는 LLM이 필요합니다."}
@@ -661,6 +680,9 @@ def ontology_add_node(space: str, node_type: str, node_id: str,
     비선언 타입이 필요하면 schema_declare로 먼저 선언하거나 schema_pack_install을 사용.
     같은 id에 같은 space/type이면 갱신, 다른 space/type이면 덮어쓰지 않고 거부한다.
     """
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
     if space not in MANIFEST["spaces"]:
         return {"error": f"알 수 없는 space: {space}. 사용 가능: {list(MANIFEST['spaces'])}"}
     buf = _get_pack(pack)
@@ -692,6 +714,9 @@ def ontology_add_edge(from_space: str, from_id: str, relation: str, to_space: st
     끝점 노드가 팩에 먼저 있어야 하고, 선언된 공간 쌍·관계만 허용된다.
     새 관계가 필요하면 schema_declare(relations=[...])로 먼저 선언한다.
     """
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
     buf = _get_pack(pack)
     for side, sid, sspace in (("from", from_id, from_space), ("to", to_id, to_space)):
         n = buf["nodes"].get(sid)
@@ -726,6 +751,9 @@ def ontology_ingest(text: str, source_id: str | None = None, pack: str = DEFAULT
     해당 출처 노드가 resource 공간에 있으면 contains 엣지가 자동 연결된다.
     (과거에는 source_id를 노드 ID로 써서 원본 Source 노드를 덮어쓰는 버그가 있었다.)
     """
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
     buf = _get_pack(pack)
     node_id = f"text:{secrets.token_hex(4)}"
     while node_id in buf["nodes"]:
@@ -877,6 +905,9 @@ def pack_import(source: str, pack: str = "정본팩") -> dict:
 
     가져온 뒤에는 pack_ask/ontology_query에 pack 이름을 주면 바로 질의된다.
     """
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
     data = _UPLOADS.pop(source, None)
     if data is None and source.startswith("http"):
         import urllib.request
@@ -899,6 +930,9 @@ def pack_import(source: str, pack: str = "정본팩") -> dict:
 def pack_build_queryable(source_zip: str, out_zip: str | None = None,
                           include_embeddings: bool = True) -> dict:
     """정본 zip을 self-contained 질의 가능 zip(indexes/ + runtime/ + reports/ 동봉)으로 재구성한다."""
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
     from . import local_pack
     return local_pack.build_queryable(source_zip, out_zip, include_embeddings)
 
@@ -1081,6 +1115,9 @@ def pack_set_default(zip_path: str) -> dict:
     이후 새 Codex 작업마다 이 팩이 자동으로 열려, 사용자는 pack_open_local 없이 바로 질문할 수 있다.
     zip_path는 사용자가 자기 팩을 저장한 경로다. 모르면 사용자에게 물어라 (사람마다 다르다).
     """
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
     import tomllib
     zip_path = os.path.expanduser(zip_path)
     if not os.path.exists(zip_path):
@@ -1133,6 +1170,9 @@ def pack_create(pack: str) -> dict:
 
     같은 이름이 이미 있으면 오류가 아니라 현황을 돌려준다 (이어서 작업 가능).
     """
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
     if pack in PACKS:
         buf = PACKS[pack]
         return {"created": False, "exists": pack,
@@ -1153,6 +1193,9 @@ def pack_ingest_local_zip(zip_path: str, pack: str = DEFAULT_PACK,
     max_files=0이면 전부. 대량이면 파일마다 LLM 호출이라 비용·시간이 든다.
     각 파일은 evidence 노드(원문)로도 남겨 근거를 보존한다.
     """
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
     zip_path = os.path.expanduser(zip_path)
     if not os.path.exists(zip_path):
         return {"error": f"zip이 없습니다: {zip_path}",
@@ -1234,6 +1277,9 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
       이 도구는 저장하지 않고 경로를 물으라는 안내(needs_save_path)를 반환한다.
       서버(챗지피티) 모드에서는 디스크에 못 쓰므로 다운로드 링크를 준다.
     """
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
     import tempfile as _tf
     from . import local_pack
     buf = _get_pack(pack)
