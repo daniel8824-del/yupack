@@ -46,7 +46,10 @@ _INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 �
   aliases_ko(별칭 목록)를 달아 두세요. 검색 인덱스에 포함되어 한국어 질의가 직접 걸립니다.
   저장 후에는 embeddings count가 0이 아닌지 확인하세요 (0이면 의미 질의 비활성).
 - 도구 구분: 열린 zip 질의는 pack_ask_local(3중 검색 + graph_path), ontology_query는
-  저작 버퍼 전용입니다. read_only 핸들에 ontology_query를 쓰면 그래프가 비어 나옵니다."""
+  저작 버퍼 전용입니다. read_only 핸들에 ontology_query를 쓰면 그래프가 비어 나옵니다.
+- 팩 저작 재료: 외국어 원문만으로 만들지 말고, 한국어 정리 노트(인물·사건 표)가 있으면
+  반드시 함께 재료로 읽어 라벨과 별칭을 한국어로 저작하세요. 한국어 커버리지가
+  처음부터 높아져 사후 보강(F.3류)이 필요 없어집니다."""
 
 mcp = FastMCP("yupack", instructions=_INSTRUCTIONS,
               transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
