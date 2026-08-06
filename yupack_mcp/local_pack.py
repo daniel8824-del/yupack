@@ -510,6 +510,38 @@ class LocalPack:
             out["direct_evidence"] = [self.card(e) for e in refs if e in self.evidence][:4]
         return out
 
+    def _rich_card(self, nid: str, score: float) -> dict:
+        """답변 후보를 '이야기 가능한 카드'로 조립: 한국어 라벨·정의·원문 요약·관계 사슬 동봉.
+
+        모델이 이 카드만 보고도 근거 인용 + 관계 서사를 쓸 수 있어야 한다.
+        (라벨·id만 주면 모델이 자기 배경지식으로 채운다 - 온톨로지 답변이 아니게 됨)
+        """
+        c = self.card(nid) or {}
+        c["id"] = nid
+        c["score"] = round(score, 4)
+        n = self.nodes.get(nid)
+        if n:
+            p = n.get("properties", {})
+            if not c.get("label"):
+                c["label"] = n.get("label") or p.get("label")
+            for key in ("label_ko", "aliases_ko"):
+                if p.get(key):
+                    c[key] = p[key]
+            # 관계 사슬: 이 후보가 그래프 어디에 걸려 있는지 (서사를 엮는 재료)
+            rels = []
+            for rel, other in self.adj.get(nid, []):
+                on = self.nodes.get(other) or {}
+                op = on.get("properties", {})
+                rels.append({"relation": rel, "id": other,
+                             "label": op.get("label_ko") or op.get("label") or on.get("label") or other})
+                if len(rels) >= 6:
+                    break
+            if rels:
+                c["relations"] = rels
+        if isinstance(c.get("summary"), str):
+            c["summary"] = c["summary"][:600]
+        return c
+
     def _cos_threshold(self) -> float:
         # 실측 캘리브레이션: bge-m3는 유근거 0.78+/무근거 0.74-, 3-large는 0.43+/0.23-
         return 0.35 if str(self.embed_model).startswith("text-embedding") else 0.76
@@ -690,9 +722,8 @@ class LocalPack:
         self._audit("ask", f"grounded: {question[:80]}")
         return {
             "status": "grounded",
-            "answer_candidates": [{"id": nid, "score": sc,
-                                    "label": (self.card(nid) or {}).get("label")}
-                                   for nid, sc in ranked[:top_k]],
+            "answer_candidates": [self._rich_card(nid, sc) for nid, sc in ranked[:top_k]],
+            "graph_path": gtrace[:30],
             "matched_levers": levers[:top_k],
             "claims": claims[:top_k],
             "direct_evidence": evs[:top_k],
