@@ -421,16 +421,22 @@ class LocalPack:
             p = os.path.join(self.root, "indexes", "lexical.sqlite")
         if not os.path.exists(p):
             return []
-        toks = [t for t in re.findall(r"[\w가-힣]+", q) if len(t) >= 2]
+        toks = [t for t in re.findall(r"[\w가-힣]+", q)
+                if len(t) >= 2 or re.fullmatch(r"[가-힣]", t)]
         if not toks:
             return []
         # 한국어 조사 대응: 각 토큰의 절단형(prefix*)도 함께 질의 ("프랑스혁명이" -> 프랑스혁명*)
+        # 1글자 한글(소·개·활)은 정확 일치로만 질의 (prefix는 소음)
         terms = []
         for t in toks[:12]:
             terms.append(f'"{t}"')
+            if len(t) == 1:
+                continue
             for cut in (t[:-1], t[:-2]):
                 if len(cut) >= 2:
                     terms.append(f'"{cut}" *'.replace('" *', '"*'))
+                elif len(cut) == 1 and re.fullmatch(r"[가-힣]", cut):
+                    terms.append(f'"{cut}"')
         con = sqlite3.connect(p)
         try:
             rows = con.execute(
