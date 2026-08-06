@@ -47,6 +47,9 @@ _INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 �
   저장 후에는 embeddings count가 0이 아닌지 확인하세요 (0이면 의미 질의 비활성).
 - 도구 구분: 열린 zip 질의는 pack_ask_local(3중 검색 + graph_path), ontology_query는
   저작 버퍼 전용입니다. read_only 핸들에 ontology_query를 쓰면 그래프가 비어 나옵니다.
+  다른 MCP 서버(유크라테스 엔진)의 query_bm25 등은 팩(zip)과 무관하니 팩 질문에 쓰지 마세요.
+- 팩 경로를 모르거나 열기에 실패하면 pack_list_local()로 팩 서랍(기본 ~/Zettelkasten/70_Ontology)을
+  스캔해 최신 zip을 고르세요. 경로 암기가 필요 없습니다.
 - 팩 저작 재료: 외국어 원문만으로 만들지 말고, 한국어 정리 노트(인물·사건 표)가 있으면
   반드시 함께 재료로 읽어 라벨과 별칭을 한국어로 저작하세요. 한국어 커버리지가
   처음부터 높아져 사후 보강(F.3류)이 필요 없어집니다."""
@@ -947,6 +950,30 @@ def _hydrate_from_zip(zip_path: str, pack: str | None = None) -> dict:
 
 
 @mcp.tool()
+def pack_list_local(directory: str = "") -> dict:
+    """팩 서랍을 스캔해 사용 가능한 팩 zip 목록을 반환한다 (최신순).
+
+    directory 생략 시 YUPACK_PACK_DIR, 그것도 없으면 ~/Zettelkasten/70_Ontology.
+    경로를 모를 때는 이 도구부터 호출해 최신 zip을 고르면 된다.
+    """
+    import glob as _glob
+    d = os.path.expanduser(directory or os.environ.get("YUPACK_PACK_DIR")
+                           or "~/Zettelkasten/70_Ontology")
+    if not os.path.isdir(d):
+        return {"error": f"디렉토리가 없습니다: {d}", "packs": []}
+    packs = []
+    for f in _glob.glob(os.path.join(d, "**", "*.zip"), recursive=True):
+        if "_archive" in f or not os.path.isfile(f):
+            continue
+        st = os.stat(f)
+        packs.append({"path": f, "size_mb": round(st.st_size / 1e6, 1),
+                      "modified": datetime.datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")})
+    packs.sort(key=lambda x: x["modified"], reverse=True)
+    return {"directory": d, "count": len(packs), "packs": packs,
+            "hint": "최신 팩을 pack_open_local(path)로 여세요."}
+
+
+@mcp.tool()
 def pack_open_local(zip_path: str, mode: str = "read_only") -> dict:
     """로컬 zip 팩을 열고 manifest.lock으로 무결성을 검증한다. pack_handle을 반환한다.
 
@@ -959,7 +986,8 @@ def pack_open_local(zip_path: str, mode: str = "read_only") -> dict:
     try:
         r = local_pack.open_local(zip_path, "read_only")
     except Exception as e:
-        return {"error": f"열기 실패: {e}"}
+        return {"error": f"열기 실패: {e}",
+                "hint": "경로가 바뀌었거나 zip이 아닐 수 있습니다. pack_list_local()로 현재 팩 목록을 확인하세요."}
     if mode == "authoring" and isinstance(r, dict) and "error" not in r:
         h = _hydrate_from_zip(zip_path)
         if "error" in h:
@@ -1083,7 +1111,8 @@ def pack_ingest_local_zip(zip_path: str, pack: str = DEFAULT_PACK,
     """
     zip_path = os.path.expanduser(zip_path)
     if not os.path.exists(zip_path):
-        return {"error": f"zip이 없습니다: {zip_path}"}
+        return {"error": f"zip이 없습니다: {zip_path}",
+                "hint": "경로가 바뀌었을 수 있습니다. pack_list_local()로 현재 팩 목록을 확인하세요."}
     if not os.environ.get("OPENAI_API_KEY"):
         return {"error": "OPENAI_API_KEY 없음: 대량 추출은 LLM이 필요합니다. "
                           "임베딩만 있는 팩이 필요하면 build 스크립트로 만든 정본을 pack_import 하세요."}
