@@ -125,6 +125,15 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
         if t:
             files[f"reports/{rep}"] = t.encode()
 
+    # 팩 생산 헌장 자동 동봉 (헌장 9조): YUPACK_CHARTER > 팩 서랍의 PACK-CHARTER.md
+    for cand in (os.environ.get("YUPACK_CHARTER"),
+                 os.path.join(os.path.expanduser(os.environ.get("YUPACK_PACK_DIR")
+                              or "~/Zettelkasten/70_Ontology"), "PACK-CHARTER.md")):
+        if cand and os.path.isfile(os.path.expanduser(cand)):
+            files["reports/pack-production-charter.md"] = open(
+                os.path.expanduser(cand), "rb").read()
+            break
+
     # graph adjacency
     adj: dict[str, list] = {}
     for e in edges:

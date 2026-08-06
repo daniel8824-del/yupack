@@ -50,6 +50,9 @@ _INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 �
   다른 MCP 서버(유크라테스 엔진)의 query_bm25 등은 팩(zip)과 무관하니 팩 질문에 쓰지 마세요.
 - 팩 경로를 모르거나 열기에 실패하면 pack_list_local()로 팩 서랍(기본 ~/Zettelkasten/70_Ontology)을
   스캔해 최신 zip을 고르세요. 경로 암기가 필요 없습니다.
+- 환경변수 YUPACK_AUTO_OPEN에 zip 경로(또는 "latest")가 있으면 서버가 시작할 때 그 팩을
+  자동으로 엽니다 - 팩 하나를 플러그인처럼 붙일 때 쓰세요. auto_open_status 리소스 참조.
+- 팩 서랍의 PACK-CHARTER.md(팩 생산 헌장)는 저장 시 자동 동봉됩니다. 저작 전에 한 번 읽으세요.
 - 답변 규율: 팩 근거로 말하는 문장에는 근거 id를 표기하고, 팩에 없는 배경지식으로 보충할 때는
   그 부분이 '일반 지식'임을 구분해 밝히세요. 팩 근거와 일반 지식을 한 문장에 섞지 마세요.
   팩이 no_local_evidence를 반환하면 "팩에는 근거가 없다"부터 말한 뒤에만 일반 지식으로 답하세요.
@@ -958,6 +961,37 @@ def _hydrate_from_zip(zip_path: str, pack: str | None = None) -> dict:
             "schema_packs": buf["schema_packs"]}
 
 
+_AUTO_OPENED: dict = {}
+
+
+def _auto_open_on_start():
+    """YUPACK_AUTO_OPEN=<zip|latest> 면 서버 기동 시 팩을 자동으로 연다 (팩 플러그인화)."""
+    global _AUTO_OPENED
+    target = os.environ.get("YUPACK_AUTO_OPEN")
+    if not target or _AUTO_OPENED:
+        return
+    try:
+        if target == "latest":
+            r = pack_list_local()
+            packs = r.get("packs") or []
+            if not packs:
+                _AUTO_OPENED = {"error": "팩 서랍이 비어 있습니다."}
+                return
+            target = packs[0]["path"]
+        from . import local_pack
+        r = local_pack.open_local(os.path.expanduser(target), "read_only")
+        _AUTO_OPENED = {"pack_handle": r["pack_handle"], "path": target}
+    except Exception as e:
+        _AUTO_OPENED = {"error": f"자동 오픈 실패: {e}"}
+
+
+@mcp.tool()
+def auto_open_status() -> dict:
+    """YUPACK_AUTO_OPEN으로 자동 오픈된 팩의 핸들·경로를 반환한다 (없으면 안내)."""
+    _auto_open_on_start()
+    return _AUTO_OPENED or {"status": "자동 오픈 설정 없음 (YUPACK_AUTO_OPEN 미설정)"}
+
+
 @mcp.tool()
 def pack_list_local(directory: str = "") -> dict:
     """팩 서랍을 스캔해 사용 가능한 팩 zip 목록을 반환한다 (최신순).
@@ -1029,6 +1063,7 @@ def pack_ask_local(question: str, pack_handle: str = "", top_k: int = 6) -> dict
         if not pk:
             return {"error": f"핸들 없음: {pack_handle}"}
         return pk.ask(question, top_k)
+    _auto_open_on_start()
     return local_pack.ask_all(question, top_k)
 
 
