@@ -516,8 +516,10 @@ class LocalPack:
         for i, h in enumerate(lex):
             score[h["id"]] = score.get(h["id"], 0) + (8 - i)
         for i, h in enumerate(vec):
-            if h["cosine"] >= thr:
-                score[h["id"]] = score.get(h["id"], 0) + (8 - i) + 2
+            # 순위 기여는 임계값 없이(교차언어 질의는 절대 코사인이 낮게 나옴),
+            # 임계값(thr)은 아래 근거 게이트(vec_strong) 판정에만 쓴다
+            bonus = (8 - i) + (2 if h["cosine"] >= thr else 0)
+            score[h["id"]] = score.get(h["id"], 0) + bonus
         ranked = sorted(score.items(), key=lambda kv: -kv[1])
         # 근거 게이트: 벡터(>=0.76) 또는 강한 어휘 일치(4자+ 토큰 정확 일치 / 2토큰 교집합)
         # 한글 1글자 단어(활·눈·신 등)는 의미어라 게이트 토큰에 포함한다

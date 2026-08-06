@@ -44,7 +44,9 @@ _INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 �
   (읽기 핸들 pack_xxxx는 질의 전용이며 저작 버퍼가 아닙니다.)
 - 말뭉치가 외국어(영어 원문 등)인 팩은 핵심 노드 properties에 label_ko(한국어 이름)와
   aliases_ko(별칭 목록)를 달아 두세요. 검색 인덱스에 포함되어 한국어 질의가 직접 걸립니다.
-  저장 후에는 embeddings count가 0이 아닌지 확인하세요 (0이면 의미 질의 비활성)."""
+  저장 후에는 embeddings count가 0이 아닌지 확인하세요 (0이면 의미 질의 비활성).
+- 도구 구분: 열린 zip 질의는 pack_ask_local(3중 검색 + graph_path), ontology_query는
+  저작 버퍼 전용입니다. read_only 핸들에 ontology_query를 쓰면 그래프가 비어 나옵니다."""
 
 mcp = FastMCP("yupack", instructions=_INSTRUCTIONS,
               transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
@@ -186,6 +188,17 @@ def _qa_scan(pack: str) -> dict:
             issues.append({"kind": "undeclared_relation", "id": eid,
                            "detail": f"{fn['space']}->{tn['space']}에 '{e['relation']}' 미선언"})
     orphans = [nid for nid in buf["nodes"] if nid not in linked] if buf["edges"] else list(buf["nodes"])
+    # 조언(상태에 영향 없음): 외국어 말뭉치인데 한국어 별칭이 전무하면 권고
+    labeled = [str((n.get("properties") or {}).get("label") or "") for n in buf["nodes"].values()]
+    labeled = [l for l in labeled if l]
+    hangul = sum(1 for l in labeled if re.search(r"[가-힣]", l))
+    alias_cnt = sum(1 for n in buf["nodes"].values()
+                    if (n.get("properties") or {}).get("label_ko")
+                    or (n.get("properties") or {}).get("aliases_ko"))
+    advisories = []
+    if len(labeled) >= 5 and hangul / len(labeled) < 0.2 and alias_cnt == 0:
+        advisories.append(f"외국어 말뭉치로 보입니다(한글 라벨 {hangul}/{len(labeled)}). "
+                          "한국어 질의 대비로 핵심 노드에 label_ko/aliases_ko 별칭을 권장합니다.")
     kinds = {i["kind"] for i in issues}
     return {
         "status": "pass" if not issues else "fail",
@@ -199,6 +212,7 @@ def _qa_scan(pack: str) -> dict:
                    "issues": len(issues), "broken_edges": broken_edges,
                    "orphan_nodes": len(orphans)},
         "orphan_node_ids": orphans[:50],
+        "advisories": advisories,
         "issues": issues,
     }
 
