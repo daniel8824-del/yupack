@@ -457,9 +457,16 @@ def schema_declare(pack: str = DEFAULT_PACK, node_types: dict | None = None,
             return {"error": f"알 수 없는 space 쌍: {fs}→{ts}. 사용 가능: {list(MANIFEST['spaces'])}"}
         if not rels:
             return {"error": f"{fs}→{ts}: relations 목록이 비어 있습니다."}
-        buf.setdefault("custom_relations", []).append(
-            {"from_space": fs, "to_space": ts, "relations": rels})
-        added_relations.append({"from_space": fs, "to_space": ts, "relations": rels})
+        cur_rels = buf.setdefault("custom_relations", [])
+        entry = next((r0 for r0 in cur_rels
+                      if r0["from_space"] == fs and r0["to_space"] == ts), None)
+        if entry is None:
+            entry = {"from_space": fs, "to_space": ts, "relations": []}
+            cur_rels.append(entry)
+        new_only = [x for x in rels if x not in entry["relations"]]
+        entry["relations"] += new_only
+        if new_only:
+            added_relations.append({"from_space": fs, "to_space": ts, "relations": new_only})
     return {"declared": {"node_types": added_types, "relations": added_relations},
             "now_custom": {"node_types": buf.get("custom_types", {}),
                            "relations": buf.get("custom_relations", [])},
@@ -478,16 +485,22 @@ def pack_qa(pack: str = DEFAULT_PACK) -> dict:
 
 @mcp.tool()
 def ontology_extract(text: str, pack: str = DEFAULT_PACK, max_nodes: int = 8) -> dict:
-    """텍스트에서 개념 노드와 관계를 LLM으로 추출해 팩 버퍼에 넣는다 (DB 쓰기 없음)."""
+    """텍스트에서 개념 노드와 관계를 LLM으로 추출해 팩 버퍼에 넣는다 (DB 쓰기 없음).
+
+    추출 관계는 그래머의 concept→concept 허용 목록(커스텀 선언 포함)으로 제한되고,
+    삽입 시에도 같은 그래머로 검증한다. 허용 밖 관계·타입 충돌 노드는 건너뛰고 보고한다.
+    """
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
         return {"error": "OPENAI_API_KEY 없음: extract는 LLM이 필요합니다."}
     import urllib.request  # openai 패키지 없이 표준 라이브러리로 호출
+    buf = _get_pack(pack)
+    allowed_rel = _edge_relations(buf, "concept", "concept") or ["related_to"]
     model = os.environ.get("OPENAI_EXTRACT_MODEL", "gpt-4o-mini")
     prompt = (f"다음 텍스트에서 핵심 개념 최대 {max_nodes}개와 개념 사이 관계를 추출해 JSON으로만 답하라. "
               '형식: {"nodes":[{"id":"c:슬러그","label":"...","definition":"..."}],'
-              '"edges":[{"from":"c:슬러그","relation":"prerequisite_of|related_to|part_of","to":"c:슬러그"}]}'
-              f"\n\n텍스트:\n{text[:6000]}")
+              f'"edges":[{{"from":"c:슬러그","relation":"{"|".join(allowed_rel)}","to":"c:슬러그"}}]}}'
+              f"\n관계는 반드시 위 목록에서만 고른다.\n\n텍스트:\n{text[:6000]}")
     body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}],
                        "response_format": {"type": "json_object"}}).encode()
     req = urllib.request.Request("https://api.openai.com/v1/chat/completions", body,
@@ -497,22 +510,35 @@ def ontology_extract(text: str, pack: str = DEFAULT_PACK, max_nodes: int = 8) ->
     except Exception as e:
         return {"error": f"LLM 호출 실패: {e}"}
     data = json.loads(resp["choices"][0]["message"]["content"])
-    buf = _get_pack(pack)
     added_n, added_e = 0, 0
+    skipped = []
     for n in data.get("nodes", [])[:max_nodes]:
         nid = n.get("id") or f"c:{secrets.token_hex(3)}"
+        existing = buf["nodes"].get(nid)
+        if existing and (existing["space"] != "concept" or existing["node_type"] != "Concept"):
+            skipped.append({"node": nid, "reason": f"기존 {existing['space']}/{existing['node_type']} 노드와 id 충돌"})
+            continue
         buf["nodes"][nid] = {"space": "concept", "node_type": "Concept",
                              "properties": {"label": n.get("label", nid),
                                              "definition": n.get("definition", "")}}
         added_n += 1
     for e in data.get("edges", []):
-        if e.get("from") in buf["nodes"] and e.get("to") in buf["nodes"]:
-            buf["edges"].append({"from_space": "concept", "from_id": e["from"],
-                                  "relation": e.get("relation", "related_to"),
-                                  "to_space": "concept", "to_id": e["to"], "properties": {}})
-            added_e += 1
-    return {"added": {"nodes": added_n, "edges": added_e},
-            "stores": {"buffer": "ok", "sqlite": _persist(pack)}}
+        rel = e.get("relation", "related_to")
+        if e.get("from") not in buf["nodes"] or e.get("to") not in buf["nodes"]:
+            continue
+        if rel not in allowed_rel:
+            skipped.append({"edge": f"{e['from']} -{rel}-> {e['to']}",
+                            "reason": f"허용 밖 관계 (허용: {allowed_rel})"})
+            continue
+        buf["edges"].append({"from_space": "concept", "from_id": e["from"],
+                              "relation": rel,
+                              "to_space": "concept", "to_id": e["to"], "properties": {}})
+        added_e += 1
+    out = {"added": {"nodes": added_n, "edges": added_e},
+           "stores": {"buffer": "ok", "sqlite": _persist(pack)}}
+    if skipped:
+        out["skipped"] = skipped
+    return out
 
 
 @mcp.tool()
@@ -796,7 +822,12 @@ def pack_import(source: str, pack: str = "정본팩") -> dict:
     if data is None:
         return {"error": "source가 업로드 토큰도 URL도 아닙니다. 먼저 zip을 POST /upload 하세요."}
     try:
-        return _import_pack_zip(data, pack)
+        r = _import_pack_zip(data, pack)
+        if isinstance(r, dict) and "error" not in r:
+            qa = _qa_scan(pack)
+            r["qa_status"] = qa["status"]
+            r["qa_issues"] = qa["counts"]["issues"]
+        return r
     except Exception as e:
         return {"error": f"가져오기 실패: {e}"}
 
@@ -904,9 +935,16 @@ def pack_set_default(zip_path: str) -> dict:
 
 @mcp.tool()
 def pack_create(pack: str) -> dict:
-    """새 팩 버퍼를 만든다 (이후 add_node/ingest/extract로 채우고 pack_save로 내보낸다)."""
+    """새 팩 버퍼를 만든다 (이후 add_node/ingest/extract로 채우고 pack_save로 내보낸다).
+
+    같은 이름이 이미 있으면 오류가 아니라 현황을 돌려준다 (이어서 작업 가능).
+    """
     if pack in PACKS:
-        return {"error": f"이미 존재: {pack}"}
+        buf = PACKS[pack]
+        return {"created": False, "exists": pack,
+                "nodes": len(buf["nodes"]), "edges": len(buf["edges"]),
+                "custom_types": buf.get("custom_types", {}),
+                "hint": "기존 팩입니다. 그대로 add_node/ingest로 이어서 작업하거나, 다른 이름으로 새로 만드세요."}
     _get_pack(pack)
     return {"created": pack, "stores": {"buffer": "ok", "sqlite": _persist(pack)}}
 
@@ -945,9 +983,13 @@ def pack_ingest_local_zip(zip_path: str, pack: str = DEFAULT_PACK,
             continue
         if not text.strip():
             continue
-        # 원문을 evidence 노드로 보존
+        # 원문을 evidence 노드로 보존 (동명 파일 충돌 시 전체 경로 해시로 고유화)
+        buf = _get_pack(pack)
         src_id = f"src:{_safe_filename(os.path.basename(name))[:40]}"
-        _get_pack(pack)["nodes"][src_id] = {
+        prev = buf["nodes"].get(src_id)
+        if prev and prev.get("properties", {}).get("source_locator") != name:
+            src_id = f"{src_id}-{hashlib.sha256(name.encode()).hexdigest()[:6]}"
+        buf["nodes"][src_id] = {
             "space": "evidence", "node_type": "TextUnit",
             "properties": {"label": os.path.basename(name), "text": text[:4000],
                             "source_locator": name}}
@@ -960,10 +1002,13 @@ def pack_ingest_local_zip(zip_path: str, pack: str = DEFAULT_PACK,
             nodes_added += r.get("added", {}).get("nodes", 0)
             edges_added += r.get("added", {}).get("edges", 0)
         done += 1
+    qa = _qa_scan(pack)
     return {"ingested_files": done, "total_files": len(mds),
             "nodes_added": nodes_added, "edges_added": edges_added, "errors": errors,
+            "qa_status": qa["status"], "qa_issues": qa["counts"]["issues"],
             "stores": {"buffer": "ok", "sqlite": _persist(pack)},
-            "next": f"pack_save(pack=\"{pack}\", save_to=\"<폴더>\")로 질의 가능 팩을 저장하세요."}
+            "next": ("pack_qa로 위반을 확인·수정한 뒤 " if qa["status"] != "pass" else "")
+                    + f"pack_save(pack=\"{pack}\", save_to=\"<폴더>\")로 질의 가능 팩을 저장하세요."}
 
 
 @mcp.tool()
@@ -971,7 +1016,9 @@ def pack_list() -> dict:
     """현재 세션의 팩 이름과 노드/엣지 개수를 나열한다."""
     return {
         name: {"nodes": len(p["nodes"]), "edges": len(p["edges"]),
-               "schema_packs": p["schema_packs"]}
+               "schema_packs": p["schema_packs"],
+               "custom_types": {s: len(t) for s, t in p.get("custom_types", {}).items()},
+               "custom_relation_pairs": len(p.get("custom_relations", []))}
         for name, p in PACKS.items()
     }
 
@@ -1044,10 +1091,16 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
         with zipfile.ZipFile(out, "a", zipfile.ZIP_DEFLATED) as z:
             for name, content in contract.items():
                 z.writestr(name, content)
+            used_names: set[str] = set()
             for nid, n in buf["nodes"].items():
                 props = n.get("properties", {})
                 label = props.get("label", nid)
-                z.writestr(f"notes/{_safe_filename(label)}.md",
+                base = _safe_filename(label)
+                fname = base
+                while fname in used_names:  # 동일 라벨 노드 md 덮어쓰기 방지
+                    fname = f"{base}-{hashlib.sha256(nid.encode()).hexdigest()[:6]}"
+                used_names.add(fname)
+                z.writestr(f"notes/{fname}.md",
                            f"---\nid: {nid}\nspace: {n['space']}\ntype: {n['node_type']}\n---\n"
                            f"# {label}\n\n{props.get('definition', props.get('text', ''))}\n")
         data = open(out, "rb").read()
