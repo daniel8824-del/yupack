@@ -144,8 +144,12 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
     rows = []
     for n in nodes:
         p = n.get("properties", {})
+        alias = p.get("aliases_ko") or []
+        if isinstance(alias, str):
+            alias = [alias]
         body = " ".join(str(x) for x in [
-            n.get("label"), p.get("label"), p.get("definition"), p.get("statement"),
+            n.get("label"), p.get("label"), p.get("label_ko"), *alias,
+            p.get("definition"), p.get("statement"),
             p.get("mechanism"), p.get("applies_when")] if x)
         rows.append((n["id"], f"node:{n.get('space','')}", body))
     for ev in evidence:
@@ -165,7 +169,11 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
             if n.get("space") == "resource":
                 continue
             p = n.get("properties", {})
-            text = " ".join(str(x) for x in [n.get("label"), p.get("definition"),
+            alias = p.get("aliases_ko") or []
+            if isinstance(alias, str):
+                alias = [alias]
+            text = " ".join(str(x) for x in [n.get("label"), p.get("label_ko"), *alias,
+                                              p.get("definition"),
                                               p.get("statement"), p.get("mechanism")] if x)[:1500]
             if text.strip():
                 targets.append((n["id"], text))
@@ -512,12 +520,25 @@ class LocalPack:
                 score[h["id"]] = score.get(h["id"], 0) + (8 - i) + 2
         ranked = sorted(score.items(), key=lambda kv: -kv[1])
         # 근거 게이트: 벡터(>=0.76) 또는 강한 어휘 일치(4자+ 토큰 정확 일치 / 2토큰 교집합)
-        q_toks = {t for t in re.findall(r"[\w가-힣]+", question) if len(t) >= 2}
+        # 한글 1글자 단어(활·눈·신 등)는 의미어라 게이트 토큰에 포함한다
+        def _gtok(s):
+            return {t for t in re.findall(r"[\w가-힣]+", s)
+                    if len(t) >= 2 or re.fullmatch(r"[가-힣]", t)}
+        q_toks = _gtok(question)
         lex_strong = False
         for h in lex:
             c = self.card(h["id"]) or {}
-            body = " ".join(str(v) for v in c.values() if isinstance(v, str))
-            d_toks = {t for t in re.findall(r"[\w가-힣]+", body) if len(t) >= 2}
+            vals = [v for v in c.values() if isinstance(v, str)]
+            # 게이트는 인덱스와 같은 본문으로 판정한다: 노드 원본 속성(label_ko·aliases_ko 등) 포함
+            n0 = (self.nodes.get(h["id"]) if isinstance(getattr(self, "nodes", None), dict) else None) or {}
+            p0 = n0.get("properties", {}) or {}
+            for v in p0.values():
+                if isinstance(v, str):
+                    vals.append(v)
+                elif isinstance(v, list):
+                    vals += [x for x in v if isinstance(x, str)]
+            body = " ".join(vals)
+            d_toks = _gtok(body)
             # 조사 대응: 정확 일치 또는 전방일치(문서 토큰이 질문 토큰의 접두)로 겹침 판정
             inter = {t for t in d_toks
                      if any(qt == t or qt.startswith(t) or t.startswith(qt) for qt in q_toks)}
@@ -587,6 +608,7 @@ class LocalPack:
                 n = self.nodes[nid]
                 p2 = n.get("properties", {})
                 body = " ".join(str(x) for x in [n.get("label"), p2.get("label"),
+                                                  p2.get("label_ko"),
                                                   p2.get("mechanism"), p2.get("applies_when")] if x)
                 toks = {t for t in re.findall(r"[\w가-힣]+", body) if len(t) >= 2}
                 inter = sum(1 for t in toks if any(

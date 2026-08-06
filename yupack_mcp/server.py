@@ -41,7 +41,10 @@ _INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 �
   (manifest.json, graph/, evidence/, quality/, neo4j/import.cypher)을 zip에 동봉합니다.
 - 저장된 팩을 이어서 편집하려면 pack_open_local(zip_path, mode="authoring")로 여세요.
   반환된 authoring_pack 이름으로 add_node/pack_qa/pack_save가 이어집니다.
-  (읽기 핸들 pack_xxxx는 질의 전용이며 저작 버퍼가 아닙니다.)"""
+  (읽기 핸들 pack_xxxx는 질의 전용이며 저작 버퍼가 아닙니다.)
+- 말뭉치가 외국어(영어 원문 등)인 팩은 핵심 노드 properties에 label_ko(한국어 이름)와
+  aliases_ko(별칭 목록)를 달아 두세요. 검색 인덱스에 포함되어 한국어 질의가 직접 걸립니다.
+  저장 후에는 embeddings count가 0이 아닌지 확인하세요 (0이면 의미 질의 비활성)."""
 
 mcp = FastMCP("yupack", instructions=_INSTRUCTIONS,
               transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
@@ -1201,6 +1204,11 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
               "counts": r["counts"], "embeddings": r["embeddings"],
               "contract_files": list(contract.keys()),
               "qa_status": qa["status"], "qa_issues": qa["counts"]["issues"]}
+    emb = r.get("embeddings") or {}
+    if not (isinstance(emb, dict) and emb.get("count")):
+        result["embedding_warning"] = ("임베딩 0개로 저장됐습니다. 한국어 등 의미(벡터) 질의가 "
+                                        "약해집니다. include_embeddings=true와 OPENAI_API_KEY "
+                                        "설정을 확인한 뒤 다시 저장하는 것을 권장합니다.")
     if qa["status"] != "pass":
         result["qa_warning"] = ("팩에 그래머 위반이 있습니다. quality/report.json 참조. "
                                 "pack_qa로 확인 후 수정하고 다시 저장하는 것을 권장합니다.")

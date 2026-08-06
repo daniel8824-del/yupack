@@ -1,6 +1,6 @@
 [project]
 name = "yupack"
-version = "0.2.1"
+version = "0.2.2"
 description = "yupack: 로컬 온톨로지 팩 MCP (생성·질의 완전 로컬, zip 하나로 완결)"
 requires-python = ">=3.11"
 dependencies = [
