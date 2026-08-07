@@ -729,13 +729,22 @@ class LocalPack:
             levers = sorted(levers, key=_lv_score, reverse=True)
         sources = sorted({e.get("source_id") for e in evs if e.get("source_id")})[:top_k]
         self._audit("ask", f"grounded: {question[:80]}")
+        vec_best = max((h["cosine"] for h in vec_all), default=0.0)
+        strength = "strong" if lex_strong else "weak"
+        guide = ("답변 작성 규칙: 후보 카드의 summary를 인용하고 relations의 관계 사슬을 "
+                 "따라 서사형으로 답하세요(단답 금지). 근거로 쓴 문장에는 근거 id를 표기하고, "
+                 "팩 밖 배경지식은 '일반 지식'으로 구분하세요. 값이 빈 보고 축(등급·검수 등)은 "
+                 "표기하지 말고 생략하세요. 답 끝에 relations의 이웃에서 이어갈 질문 1~2개를 "
+                 "제안하세요.")
+        if strength == "weak":
+            guide = ("주의: 이 질문의 어휘가 팩 근거 본문과 직접 겹치지 않습니다(약한 근거). "
+                     "\"팩에 이 질문의 직접 근거는 뚜렷하지 않다\"를 먼저 밝히고, 후보 중 실제로 "
+                     "관련 있는 것만 골라 답하거나 일반 지식으로 구분해 답하세요. ") + guide
         return {
             "status": "grounded",
-            "answer_guide": ("답변 작성 규칙: 후보 카드의 summary를 인용하고 relations의 관계 사슬을 "
-                              "따라 서사형으로 답하세요(단답 금지). 근거로 쓴 문장에는 근거 id를 표기하고, "
-                              "팩 밖 배경지식은 '일반 지식'으로 구분하세요. 값이 빈 보고 축(등급·검수 등)은 "
-                              "표기하지 말고 생략하세요. 답 끝에 relations의 이웃에서 이어갈 질문 1~2개를 "
-                              "제안하세요."),
+            "grounding": {"strength": strength, "lexical_match": bool(lex_strong),
+                           "max_cosine": round(vec_best, 3)},
+            "answer_guide": guide,
             "answer_candidates": [self._rich_card(nid, sc) for nid, sc in ranked[:top_k]],
             "graph_path": gtrace[:30],
             "matched_levers": levers[:top_k],
