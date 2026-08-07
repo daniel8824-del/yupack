@@ -24,12 +24,22 @@ EMBED_URL = os.environ.get("YUPACK_EMBED_URL", "http://127.0.0.1:8000/v1/embeddi
 # 임베딩 = OpenAI 강제 (Daniel 확정 2026-08-05): 로컬 모델 자동 폴백 없음.
 # 키가 없으면 임베딩을 생략하고 어휘+그래프로 동작한다 (질의는 여전히 가능).
 # bge-m3는 YUPACK_EMBED_MODEL=bge-m3 명시 때만 (OMLX 가동 필요).
+def _qmd_available() -> bool:
+    import shutil
+    return shutil.which("qmd") is not None
+
+
 def _pick_model() -> tuple[str, int]:
     forced = os.environ.get("YUPACK_EMBED_MODEL")
     if forced == "bge-m3":
         return "bge-m3", 1024
+    if forced == "qmd":
+        return "qmd", 768
     if forced:
         return forced, {"text-embedding-3-large": 3072, "text-embedding-3-small": 1536}.get(forced, 1536)
+    # 무키 + qmd 설치 = 로컬 무료 벡터 (EmbeddingGemma 768d, 실측 30/30)
+    if not os.environ.get("OPENAI_API_KEY") and _qmd_available():
+        return "qmd", 768
     return "text-embedding-3-small", 1536
 
 
@@ -65,6 +75,82 @@ def _embed(texts: list[str], model: str | None = None) -> list[list[float]] | No
         return [r["embedding"] for r in d["data"]]
     except Exception:
         return None
+
+
+QMD_DIR = os.path.expanduser(os.environ.get("YUPACK_QMD_DIR", "~/.cache/yupack/qmd"))
+
+
+def _qmd_collection_name(pack_id: str) -> str:
+    return "yupack-" + re.sub(r"[^a-zA-Z0-9_-]", "-", pack_id)[:48]
+
+
+def _qmd_doc_text(n: dict) -> str:
+    p = n.get("properties", {})
+    alias = p.get("aliases_ko") or []
+    if isinstance(alias, str):
+        alias = [alias]
+    return " ".join(str(x) for x in [n.get("label") or p.get("label"), p.get("label_ko"), *alias,
+                                      p.get("text"), p.get("definition"), p.get("statement"),
+                                      p.get("mechanism")] if x)[:1500]
+
+
+def _qmd_ensure_collection(pack_id: str, nodes: dict) -> str | None:
+    """팩 노드들을 qmd 컬렉션으로 보장한다 (멱등). 성공 시 컬렉션명, 실패 시 None."""
+    import subprocess
+    if not _qmd_available():
+        return None
+    col = _qmd_collection_name(pack_id)
+    d = os.path.join(QMD_DIR, col)
+    os.makedirs(d, exist_ok=True)
+    wrote = 0
+    for nid, n in nodes.items():
+        if n.get("space") == "resource":
+            continue
+        text = _qmd_doc_text(n)
+        if not text.strip():
+            continue
+        fp = os.path.join(d, nid.replace(":", "__") + ".md")
+        p = n.get("properties", {})
+        body = f"# {p.get('label_ko') or p.get('label') or nid}\n\n{text}\n"
+        try:
+            if not os.path.exists(fp) or open(fp, encoding="utf-8").read() != body:
+                open(fp, "w", encoding="utf-8").write(body)
+                wrote += 1
+        except Exception:
+            continue
+    try:
+        r = subprocess.run(["qmd", "collection", "show", col], capture_output=True, text=True, timeout=30)
+        if r.returncode != 0 or col not in (r.stdout + r.stderr):
+            subprocess.run(["qmd", "collection", "add", d, "--name", col],
+                            capture_output=True, text=True, timeout=60)
+        if wrote:
+            subprocess.run(["qmd", "update"], capture_output=True, text=True, timeout=300)
+        subprocess.run(["qmd", "embed", "-c", col], capture_output=True, text=True, timeout=600)
+        return col
+    except Exception:
+        return None
+
+
+def _qmd_vector_search(col: str, q: str, k: int) -> list[dict]:
+    import subprocess
+    if not q:
+        return []
+    try:
+        out = subprocess.run(["qmd", "query", "vec: " + q, "-c", col, "-n", str(k)],
+                              capture_output=True, text=True, timeout=90).stdout
+    except Exception:
+        return []
+    hits, cur = [], None
+    for ln in out.splitlines():
+        m = re.match(rf"qmd://{re.escape(col)}/(.+?)\.md", ln.strip())
+        if m:
+            cur = m.group(1).replace("__", ":")
+            continue
+        m2 = re.search(r"Score:\s+(\d+)%", ln)
+        if m2 and cur:
+            hits.append({"id": cur, "cosine": int(m2.group(1)) / 100.0, "text": ""})
+            cur = None
+    return hits[:k]
 
 
 def _jsonl(text: str) -> list[dict]:
@@ -172,7 +258,17 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
 
     # vectors (로컬 bge-m3)
     emb_meta, emb_status = [], "skipped"
-    if include_embeddings:
+    qmd_backend = (EMBED_MODEL == "qmd")
+    if include_embeddings and qmd_backend:
+        # 무키 로컬 벡터: 노드를 qmd 컬렉션으로 (EmbeddingGemma 768d, 실측 30/30)
+        nd = {n["id"]: n for n in nodes}
+        _pid = os.path.splitext(os.path.basename(out_zip or source_zip))[0]
+        col = _qmd_ensure_collection(_pid, nd)
+        if col:
+            emb_status = f"qmd({col}, embeddinggemma-768d, 로컬 무료)"
+        else:
+            emb_status = "unavailable(qmd 실행 실패): lexical+graph로 동작"
+    if include_embeddings and not qmd_backend:
         targets = []
         for n in nodes:
             if n.get("space") == "resource":
@@ -377,7 +473,7 @@ class LocalPack:
         self.reviews: dict[str, list] = {}
         for r in _jsonl(self._read("reviews.jsonl")):
             self.reviews.setdefault(r["target_id"], []).append(
-                {"status": r.get("review_status"), "reviewer_role": r.get("reviewer_role")})
+                {"status": r.get("review_status"), "reviewer_role": r.get("reviewer_role"), "backend": "qmd" if qmd_backend else "openai"})
         self.adj: dict[str, list] = {}
         adj_p = os.path.join(root, "graph-index", "adjacency.jsonl")
         if not os.path.exists(adj_p):
@@ -457,7 +553,23 @@ class LocalPack:
         con.close()
         return [{"id": r[0], "kind": r[1], "bm25": round(r[2], 3)} for r in rows]
 
+    def _qmd_col_lazy(self) -> str | None:
+        if getattr(self, "_qmd_col", "unset") == "unset":
+            self._qmd_col = _qmd_ensure_collection(self.pack_id, self.nodes) if _qmd_available() else None
+            # qmd는 URI에서 파일명의 특수문자를 '-'로 눌러 보여주므로 슬러그->실 id 역매핑 필요
+            self._qmd_slug2id = {re.sub(r"[^a-z0-9]+", "-", nid.lower()): nid for nid in self.nodes}
+        return self._qmd_col
+
     def vector(self, q: str, k: int = 8) -> list[dict]:
+        # 무키 로컬 경로: 런타임이 qmd거나 저장 벡터가 없으면 qmd 컬렉션으로 (있을 때만)
+        if EMBED_MODEL == "qmd" or not self.vec_meta:
+            col = self._qmd_col_lazy()
+            if col:
+                hits = _qmd_vector_search(col, q, k)
+                s2i = getattr(self, "_qmd_slug2id", {})
+                for h in hits:
+                    h["id"] = s2i.get(re.sub(r"[^a-z0-9]+", "-", h["id"].lower()), h["id"])
+                return hits
         if not self.vec_meta:
             return []
         # 질의 임베딩은 팩을 구운 모델과 동일해야 한다 (embeddings.json 기록 기준)
@@ -552,7 +664,10 @@ class LocalPack:
         return c
 
     def _cos_threshold(self) -> float:
-        # 실측 캘리브레이션: bge-m3는 유근거 0.78+/무근거 0.74-, 3-large는 0.43+/0.23-
+        # 실측 캘리브레이션: bge-m3는 유근거 0.78+/무근거 0.74-, 3-large는 0.43+/0.23-,
+        # qmd(젬마 rerank %)는 유관 0.88+ 실측 - strong 컷 0.55
+        if EMBED_MODEL == "qmd" or (not self.vec_meta and getattr(self, "_qmd_col", None)):
+            return 0.55
         return 0.35 if str(self.embed_model).startswith("text-embedding") else 0.76
 
     def _translate_query_en(self, q: str) -> str | None:
