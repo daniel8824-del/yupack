@@ -65,6 +65,11 @@ _GATE_META_KEYS = {"source_path", "source_id", "source_locator", "locator", "pat
                    "id", "evidence_id", "kind", "assertion_mode", "extraction_note",
                    "source_map_scope", "evidence_role"}
 
+# 근거 게이트 본문으로 인정하는 "서술 텍스트" 필드 (화이트리스트)
+_GATE_TEXT_KEYS = {"label", "label_ko", "aliases_ko", "text", "summary", "definition",
+                   "statement", "description", "mechanism", "applies_when", "tradeoffs",
+                   "eli5", "note", "body"}
+
 _EN_STOPWORDS = {"the", "a", "an", "is", "are", "was", "were", "be", "been", "of", "in",
                  "on", "at", "to", "for", "and", "or", "but", "with", "from", "by", "as",
                  "what", "who", "whom", "when", "where", "why", "how", "which", "that",
@@ -598,9 +603,19 @@ class LocalPack:
                 elif len(cut) == 1 and re.fullmatch(r"[가-힣]", cut):
                     terms.append(f'"{cut}"')
         con = sqlite3.connect(p)
+        # FTS 스키마는 팩 빌더마다 다르다: 구형은 (id, kind, body),
+        # 신형은 (id, work_id, space, node_type, text). 없는 컬럼을 고정 참조하면
+        # OperationalError가 나고 어휘 축이 통째로 조용히 죽는다 — 컬럼을 보고 고른다.
+        try:
+            cols = [r[1] for r in con.execute("PRAGMA table_info(docs)")]
+        except sqlite3.OperationalError:
+            con.close()
+            return []
+        kind_col = next((c for c in ("kind", "node_type", "space") if c in cols), None)
+        sel = f"id, {kind_col}, bm25(docs)" if kind_col else "id, '', bm25(docs)"
         try:
             rows = con.execute(
-                "SELECT id, kind, bm25(docs) FROM docs WHERE docs MATCH ? "
+                f"SELECT {sel} FROM docs WHERE docs MATCH ? "
                 "ORDER BY bm25(docs) LIMIT ?",
                 (" OR ".join(dict.fromkeys(terms)), k)).fetchall()
         except sqlite3.OperationalError:
@@ -845,14 +860,15 @@ class LocalPack:
         for h in lex + lex_en:
             c = self.card(h["id"]) or {}
             vals = [v for k0, v in c.items()
-                    if isinstance(v, str) and k0 not in _GATE_META_KEYS]
+                    if isinstance(v, str) and k0 in _GATE_TEXT_KEYS]
             # 게이트는 인덱스와 같은 본문으로 판정한다: 노드 원본 속성(label_ko·aliases_ko 등) 포함
             n0 = (self.nodes.get(h["id"]) if isinstance(getattr(self, "nodes", None), dict) else None) or {}
             p0 = n0.get("properties", {}) or {}
             for k0, v in p0.items():
-                # 경로·식별자성 메타데이터는 근거 본문이 아니다. 파일명의 날짜(2026-08-04)나
-                # 경로 문자열이 질문 토큰과 겹쳐 게이트를 뚫던 문제 차단.
-                if k0 in _GATE_META_KEYS:
+                # 게이트 본문은 "사람이 읽는 서술"만으로 만든다. 경로·식별자·빌드 스탬프
+                # (actor-attribution-2026-08-11 등)가 질문 토큰과 겹쳐 게이트를 뚫던 문제를
+                # 블랙리스트 대신 화이트리스트로 막는다 — 새 메타 필드가 생겨도 새지 않는다.
+                if k0 not in _GATE_TEXT_KEYS:
                     continue
                 if isinstance(v, str):
                     vals.append(v)
@@ -878,7 +894,9 @@ class LocalPack:
                     "manifest_hash": self.manifest_hash,
                     "message": "이 팩에는 질문을 뒷받침할 로컬 근거가 없습니다. "
                                "일반 지식/클라우드로 대체하지 마세요."}
-        seeds = [nid for nid, _ in ranked[:(6 if causal else 4)]]
+        # 인과 질문은 시드를 넓게 잡는다. 어휘가 8건 쏟아지면 벡터 상위가 시드에서 밀려
+        # 인과 경로 진입점을 놓친다 — 두 채널 상위가 모두 시드에 들어오게 한다.
+        seeds = [nid for nid, _ in ranked[:(12 if causal else 4)]]
         visited, gtrace = self.expand(seeds, 3)
         ctrace: list[dict] = []
         if causal:
@@ -896,10 +914,18 @@ class LocalPack:
         # 발견 순서(시드 -> 가까운 홉부터)로 카드화: 무작위 set 순서로 레버가 잘리는 문제 방지
         # 인과 경로 노드를 배관 evidence보다 앞세운다 (top_k를 evidence가 전부 점유하던 문제)
         # 인과 경로 위의 노드와 그 위에 걸린 Claim·Evidence를 최우선으로 카드화한다.
+        # 인과 사슬 위의 노드, 그리고 "그 노드에 직접 걸린" Claim·Evidence만 앞세운다.
+        # 투영 대상을 전부 끌어오면 팩 전체의 주제 Claim이 밀려들어 직답 Claim을 덮는다.
+        chain_nodes = {t["from"] for t in ctrace if t["axis"] == "causal"} | \
+                      {t["to"] for t in ctrace if t["axis"] == "causal"}
         prio = [t["to"] for t in ctrace if t["axis"] == "causal"]
-        prio += [t["to"] for t in ctrace if t["axis"] == "projection"
+        prio += [t["to"] for t in ctrace
+                 if t["axis"] == "projection" and t["from"] in chain_nodes
                  and (self.nodes.get(t["to"], {}) or {}).get("space") in ("claim", "evidence")]
-        discovery = list(seeds) + prio + [t["to"] for t in ctrace] + [t["to"] for t in gtrace]
+        # 인과 질문에서는 인과 경로와 그 위의 Claim·Evidence가 시드보다 앞선다.
+        # 어휘가 끌어온 주제 Claim이 top_k를 선점해 질문에 직답하는 Claim이 밀리던 문제.
+        head = (prio + list(seeds)) if causal else (list(seeds) + prio)
+        discovery = head + [t["to"] for t in ctrace] + [t["to"] for t in gtrace]
         seen_o = set()
         ordered = [n for n in discovery if not (n in seen_o or seen_o.add(n))]
         # 레버는 잘리지 않게 전부 뒤에 보강 (거리순 유지)
