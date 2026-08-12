@@ -87,3 +87,44 @@ def test_no_retrieval_evidence_still_refuses():
     finally:
         tmp.cleanup()
     assert answer["status"] == "no_local_evidence"
+
+
+def test_causal_claim_evidence_is_promoted_alongside_direct_hits():
+    """A causal Claim's own evidence must not be hidden behind an unrelated hit."""
+    tmp = tempfile.TemporaryDirectory()
+    try:
+        path = Path(tmp.name) / "causal-claim.zip"
+        nodes = [
+            {"id": "ev:generic", "label": "Generic evidence", "space": "evidence",
+             "node_type": "TextUnit", "properties": {"text": "A nearby but generic fact."}},
+            {"id": "claim:cause", "label": "Causal claim", "space": "claim",
+             "node_type": "Claim", "properties": {"statement": "The named act caused the delay.",
+                                                    "evidence_refs": ["ev:causal"]}},
+            {"id": "ev:causal", "label": "Causal evidence", "space": "evidence",
+             "node_type": "TextUnit", "properties": {"text": "The named act caused the delay.",
+                                                            "locator": "Chapter 9"}},
+        ]
+        evidence = [
+            {"evidence_id": "ev:generic", "summary": "A nearby but generic fact.",
+             "source_id": "fixture-book", "source_locator": "Chapter 1"},
+            {"evidence_id": "ev:causal", "summary": "The named act caused the delay.",
+             "source_id": "fixture-book", "source_locator": "Chapter 9"},
+        ]
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("nodes.jsonl", "".join(json.dumps(n) + "\n" for n in nodes))
+            z.writestr("edges.jsonl", "")
+            z.writestr("evidence.jsonl", "".join(json.dumps(e) + "\n" for e in evidence))
+            z.writestr("reviews.jsonl", "")
+            z.writestr("graph-index/adjacency.jsonl", "")
+        pack = LocalPack(str(path))
+        pack.lexical = lambda _q, _k: [
+            {"id": "ev:generic", "kind": "Evidence", "bm25": -1.0},
+            {"id": "claim:cause", "kind": "Claim", "bm25": -0.9},
+        ]
+        pack.vector = lambda _q, _k: []
+        answer = pack.ask("Why did the delay happen?")
+    finally:
+        tmp.cleanup()
+    assert answer["status"] == "grounded"
+    assert answer["causal_assessment"]["status"] == "not_proven_from_local_graph"
+    assert [e["evidence_id"] for e in answer["direct_evidence"][:2]] == ["ev:causal", "ev:generic"]

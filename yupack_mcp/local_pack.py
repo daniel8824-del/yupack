@@ -21,8 +21,8 @@ import zipfile
 
 EMBED_URL = os.environ.get("YUPACK_EMBED_URL", "http://127.0.0.1:8000/v1/embeddings")
 
-# 임베딩 = OpenAI 강제 (Daniel 확정 2026-08-05): 로컬 모델 자동 폴백 없음.
-# 키가 없으면 임베딩을 생략하고 어휘+그래프로 동작한다 (질의는 여전히 가능).
+# 정본의 기본 계약은 text-embedding-3-large(3072d)다.
+# 키가 없는 환경에서만 QMD/EmbeddingGemma(768d)를 무료 대체 경로로 쓴다.
 # bge-m3는 YUPACK_EMBED_MODEL=bge-m3 명시 때만 (OMLX 가동 필요).
 def _qmd_available() -> bool:
     import shutil
@@ -40,7 +40,7 @@ def _pick_model() -> tuple[str, int]:
     # 무키 + qmd 설치 = 로컬 무료 벡터 (EmbeddingGemma 768d, 실측 30/30)
     if not os.environ.get("OPENAI_API_KEY") and _qmd_available():
         return "qmd", 768
-    return "text-embedding-3-small", 1536
+    return "text-embedding-3-large", 3072
 
 
 EMBED_MODEL, EMBED_DIM = _pick_model()
@@ -957,6 +957,20 @@ class LocalPack:
                     if eid and eid not in seen_evidence:
                         seen_evidence.add(eid)
                         evs.append(ev)
+        # 인과 질문에서는 Claim에 딸린 직접 근거를 최상위에도 앞세운다.
+        # 그래야 호출자는 "왜"에 대한 증거(예: prayer)를 후보 Claim 안까지
+        # 다시 파고들지 않고 확인할 수 있다. 그래프가 없어도 Claim의 evidence_refs
+        # 투영은 그대로 작동한다.
+        if causal and claims:
+            claim_evidence, seen_evidence = [], set()
+            for c in claims:
+                for ev in c.get("direct_evidence", []):
+                    eid = ev.get("evidence_id")
+                    if eid and eid not in seen_evidence:
+                        seen_evidence.add(eid)
+                        claim_evidence.append(ev)
+            evs = claim_evidence + [ev for ev in evs
+                                    if ev.get("evidence_id") not in seen_evidence]
         # source/evidence 없는 lever는 추천으로 반환하지 않는다 (정책)
         levers = [l for l in levers if l.get("direct_evidence") or l.get("evidence_refs")]
         # 레버 보증: grounded인데 3홉 안에 레버가 없으면, 매칭 노드에서 BFS로 가장 가까운 레버를 찾는다
@@ -1079,7 +1093,14 @@ class LocalPack:
                                  "question_intent": "causal" if causal else "factual",
                                  "rerank": f"RRF(k={RRF_K}) over lexical+vector"
                                            + ("+causal-graph" if causal else "")
-                                           + f", cosine>={thr} ({self.embed_model} 실측 캘리브레이션)"},
+                                           + f", cosine>={thr} ({self.embed_model} 실측 캘리브레이션)",
+                                 "embedding": {
+                                     "runtime_model": EMBED_MODEL,
+                                     "runtime_dimension": EMBED_DIM,
+                                     "pack_model": self.embed_model,
+                                     "pack_dimension": self.dim,
+                                     "backend": "qmd" if EMBED_MODEL == "qmd" else "pack_vectors",
+                                 }},
             "local_pack_id": self.pack_id,
             "manifest_hash": self.manifest_hash,
             "governance": {"decision_core": "local_validation_required",
