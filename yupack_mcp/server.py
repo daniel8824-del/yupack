@@ -1591,10 +1591,11 @@ def _authoring_quality(buf: dict) -> dict:
         counts[space] = counts.get(space, 0) + 1
     evidence = counts.get("evidence", 0)
     structured = sum(count for space, count in counts.items() if space != "evidence")
-    return {"status": "pass" if not evidence or structured else "needs_authoring",
-            "counts": counts, "structured_nodes": structured,
+    answer_bearing = counts.get("claim", 0) + counts.get("kinetic", 0)
+    return {"status": "pass" if not evidence or answer_bearing else "needs_authoring",
+            "counts": counts, "structured_nodes": structured, "answer_bearing_nodes": answer_bearing,
             "note": ("Kinetic은 서사·사건형 작품에서만 품질 지표입니다. 논증형 팩은 Claim과 Evidence만으로도 통과합니다."
-                     if structured else "근거 Evidence만 있고 Concept·Claim·Kinetic이 없습니다. 이 상태는 경량 초안이며 완성 팩으로 저장할 수 없습니다.")}
+                     if answer_bearing else "근거 Evidence만 있거나 Concept 이름만 있습니다. Claim 또는 Kinetic이 없는 이 상태는 경량 초안이며 완성 팩으로 저장할 수 없습니다.")}
 
 
 @mcp.tool()

@@ -42,10 +42,12 @@ class LocalAuthoringTest(unittest.TestCase):
         self.assertTrue(any(e["relation"] == "triggers" for e in server.PACKS["test-local"]["edges"]))
         self.assertEqual(server.pack_quality("test-local")["status"], "pass")
 
-    def test_evidence_only_pack_cannot_be_saved_as_final(self):
+    def test_evidence_or_concept_only_pack_cannot_be_saved_as_final(self):
         server.PACKS["thin"] = {"nodes": {
             "ev:only": {"space": "evidence", "node_type": "TextUnit",
-                        "properties": {"label": "원문", "text": "근거만 있음"}}
+                        "properties": {"label": "원문", "text": "근거만 있음"}},
+            "concept:only": {"space": "concept", "node_type": "Entity",
+                             "properties": {"label": "이름만 있음"}},
         }, "edges": [], "schema_packs": []}
 
         self.assertEqual(server.pack_quality("thin")["status"], "needs_authoring")
