@@ -45,6 +45,33 @@ def _pick_model() -> tuple[str, int]:
 
 EMBED_MODEL, EMBED_DIM = _pick_model()
 
+# 인과 축 (2026-08-12): "왜" 계열 질문은 방향을 보존한 인과 확장 + Claim 투영이 필요하다.
+# 배관 관계(contains/contains_segment)는 원문 분할 구조라 인과 확장에서 제외한다.
+CAUSAL_RELS = {"triggers", "causes", "prevents", "enables", "results_in",
+               "precondition_of", "leads_to", "part_of_process", "realizes"}
+PROJECT_RELS = {"records", "supports", "characterizes", "about"}
+PLUMBING_RELS = {"contains", "contains_segment"}
+_CAUSAL_Q = re.compile(r"왜|어째서|어찌|무슨 이유|원인|이유|때문|대가|탓|초래|결과적으로"
+                       r"|why|cause|because")
+
+
+def _is_causal_question(q: str) -> bool:
+    return bool(_CAUSAL_Q.search(q))
+
+
+# 근거 게이트 판정에서 제외할 메타데이터 키 (경로·식별자·순서 정보는 근거 본문이 아니다)
+_GATE_META_KEYS = {"source_path", "source_id", "source_locator", "locator", "path", "url",
+                   "node_id", "graph_id", "evidence_refs", "source_order", "story_order",
+                   "id", "evidence_id", "kind", "assertion_mode", "extraction_note",
+                   "source_map_scope", "evidence_role"}
+
+_EN_STOPWORDS = {"the", "a", "an", "is", "are", "was", "were", "be", "been", "of", "in",
+                 "on", "at", "to", "for", "and", "or", "but", "with", "from", "by", "as",
+                 "what", "who", "whom", "when", "where", "why", "how", "which", "that",
+                 "this", "these", "those", "do", "does", "did", "it", "its", "his", "her",
+                 "their", "there", "have", "has", "had", "not", "than", "then", "so"}
+
+
 _HANDLES: dict[str, "LocalPack"] = {}
 
 
@@ -600,14 +627,62 @@ class LocalPack:
                 break
         return visited, trace
 
+    def causal_expand(self, seeds: list[str], hops: int = 4, cap: int = 240):
+        """인과 축 확장. expand()와 달리 (1) 노드당 엣지를 자르지 않고 (2) 배관 관계를 건너뛰며
+        (3) 인과 관계는 방향을 보존해 trace에 남기고 (4) Evidence에서 records/supports로
+        Action·Claim을 답변 후보로 투영한다. 허브 노드(per:* 87엣지 등)에서 인과 체인이
+        잘려나가던 문제의 해소가 목적이다."""
+        visited, trace, frontier = set(seeds), [], list(seeds)
+        for hop in range(hops):
+            nxt = []
+            for nid in frontier:
+                # 인과 > 투영(Claim·Evidence) > 진입(performs/involves) 순으로 훑는다.
+                # 허브의 performs 72개가 먼저 예산을 먹어 Claim이 밀려나던 문제 방지.
+                def _prio(e):
+                    b = e[0].lstrip("~")
+                    return 0 if b in CAUSAL_RELS else (1 if b in PROJECT_RELS else 2)
+                for rel, other in sorted(self.adj.get(nid, []), key=_prio):
+                    base = rel.lstrip("~")
+                    if base in PLUMBING_RELS:
+                        continue
+                    is_causal = base in CAUSAL_RELS
+                    # 인과·투영 관계, 그리고 인물/신 <-> 행위 진입로(performs/involves)만 탄다.
+                    if not (is_causal or base in PROJECT_RELS
+                            or base in ("performs", "involves")):
+                        continue
+                    if other in visited or len(visited) >= cap:
+                        continue
+                    visited.add(other)
+                    nxt.append(other)
+                    trace.append({
+                        "hop": hop + 1, "from": nid, "rel": base,
+                        "direction": "reverse" if rel.startswith("~") else "forward",
+                        "to": other,
+                        "axis": "causal" if is_causal else "projection",
+                        "from_label": (self.nodes.get(nid) or {}).get("label"),
+                        "to_label": (self.nodes.get(other) or {}).get("label"),
+                    })
+            frontier = nxt
+            if not frontier:
+                break
+        return visited, trace
+
     def card(self, nid: str) -> dict | None:
         if nid in self.evidence:
             ev = self.evidence[nid]
-            return {"kind": "evidence",
-                    **{k: ev.get(k) for k in ("evidence_id", "summary", "conditions",
-                                                "limitations", "evidence_grade",
-                                                "source_id", "source_locator")},
-                    "review_status": self.reviews.get(nid, [])}
+            out = {"kind": "evidence",
+                   **{k: ev.get(k) for k in ("evidence_id", "summary", "conditions",
+                                               "limitations", "evidence_grade",
+                                               "source_id", "source_locator")},
+                   "review_status": self.reviews.get(nid, [])}
+            # locator/source_path는 nodes.jsonl 쪽에만 있다 (evidence.jsonl은 요약만 보유)
+            p = (self.nodes.get(nid) or {}).get("properties", {})
+            for k in ("locator", "source_path"):
+                if p.get(k) and not out.get(k):
+                    out[k] = p[k]
+            if not out.get("summary") and p.get("text"):
+                out["summary"] = p["text"]
+            return out
         n = self.nodes.get(nid)
         if not n:
             return None
@@ -615,7 +690,8 @@ class LocalPack:
         out = {"kind": f"node:{n.get('space')}", "id": nid,
                "label": n.get("label") or p.get("label"),
                "review_status": self.reviews.get(nid, [])}
-        for key in ("definition", "statement", "mechanism", "applies_when", "tradeoffs",
+        for key in ("definition", "statement", "text", "label_ko", "mechanism",
+                     "applies_when", "tradeoffs",
                      "validation_probe", "evidence_refs", "measurement", "rule"):
             if p.get(key):
                 out[key] = p[key]
@@ -696,12 +772,15 @@ class LocalPack:
 
     def ask(self, question: str, top_k: int = 6) -> dict:
         thr = self._cos_threshold()
-        lex = self.lexical(question, 12)
-        vec = self.vector(question, 12)
+        # 인과 질문은 후보 창을 넓힌다: Claim·State가 evidence에 밀려 잘리던 문제
+        causal = _is_causal_question(question)
+        k_ret = 20 if causal else 12
+        lex = self.lexical(question, k_ret)
+        vec = self.vector(question, k_ret)
         # 한·영 이중 질의: 한글 질문은 영어 번역으로도 검색해 RRF에 합류 (영문 말뭉치 재현율)
         q_en = self._translate_query_en(question)
-        lex_en = self.lexical(q_en, 12) if q_en else []
-        vec_en = self.vector(q_en, 12) if q_en else []
+        lex_en = self.lexical(q_en, k_ret) if q_en else []
+        vec_en = self.vector(q_en, k_ret) if q_en else []
         # 같은 id가 채널 안에서 두 번(노드행+근거행) 잡히면 첫 순위만 인정 (이중계상 방지)
         def _dedupe(hits):
             seen, out = set(), []
@@ -714,39 +793,52 @@ class LocalPack:
         lex, vec = _dedupe(lex), _dedupe(vec)
         lex_en, vec_en = _dedupe(lex_en), _dedupe(vec_en)
         # RRF 융합: 한 채널의 절대점수 지배를 막고 여러 채널에 잡힌 후보를 위로
+        RRF_K = 6
         score: dict[str, float] = {}
         for hits in (lex, lex_en):
             for i, h in enumerate(hits):
-                score[h["id"]] = score.get(h["id"], 0) + 1.0 / (6 + i)
+                score[h["id"]] = score.get(h["id"], 0) + 1.0 / (RRF_K + i)
         for hits in (vec, vec_en):
             for i, h in enumerate(hits):
                 # 순위 기여는 임계값 없이(교차언어 질의는 절대 코사인이 낮게 나옴),
                 # 임계값(thr)은 아래 근거 게이트(vec_strong) 판정에만 쓴다
-                score[h["id"]] = score.get(h["id"], 0) + 1.0 / (6 + i) + (0.05 if h["cosine"] >= thr else 0)
+                score[h["id"]] = score.get(h["id"], 0) + 1.0 / (RRF_K + i) + (0.05 if h["cosine"] >= thr else 0)
         ranked = sorted(score.items(), key=lambda kv: -kv[1])
         # 근거 게이트: 벡터(>=0.76) 또는 강한 어휘 일치(4자+ 토큰 정확 일치 / 2토큰 교집합)
         # 한글 1글자 단어(활·눈·신 등)는 의미어라 게이트 토큰에 포함한다
         def _gtok(s):
             return {t for t in re.findall(r"[\w가-힣]+", s)
                     if len(t) >= 2 or re.fullmatch(r"[가-힣]", t)}
-        q_toks = _gtok(question) | (_gtok(q_en) if q_en else set())
+        # 영어 번역 질의의 불용어는 게이트에서 뺀다: "the"/"for"가 3글자라 단독으로
+        # 강한 어휘 일치 판정을 통과시키던 문제 (한글 3글자=의미어 규칙의 영어 오적용)
+        q_toks = {t for t in (_gtok(question) | (_gtok(q_en) if q_en else set()))
+                  if t.lower() not in _EN_STOPWORDS}
         lex_strong = False
         for h in lex + lex_en:
             c = self.card(h["id"]) or {}
-            vals = [v for v in c.values() if isinstance(v, str)]
+            vals = [v for k0, v in c.items()
+                    if isinstance(v, str) and k0 not in _GATE_META_KEYS]
             # 게이트는 인덱스와 같은 본문으로 판정한다: 노드 원본 속성(label_ko·aliases_ko 등) 포함
             n0 = (self.nodes.get(h["id"]) if isinstance(getattr(self, "nodes", None), dict) else None) or {}
             p0 = n0.get("properties", {}) or {}
-            for v in p0.values():
+            for k0, v in p0.items():
+                # 경로·식별자성 메타데이터는 근거 본문이 아니다. 파일명의 날짜(2026-08-04)나
+                # 경로 문자열이 질문 토큰과 겹쳐 게이트를 뚫던 문제 차단.
+                if k0 in _GATE_META_KEYS:
+                    continue
                 if isinstance(v, str):
                     vals.append(v)
                 elif isinstance(v, list):
                     vals += [x for x in v if isinstance(x, str)]
             body = " ".join(vals)
             d_toks = _gtok(body)
-            # 조사 대응: 정확 일치 또는 전방일치(문서 토큰이 질문 토큰의 접두)로 겹침 판정
-            inter = {t for t in d_toks
-                     if any(qt == t or qt.startswith(t) or t.startswith(qt) for qt in q_toks)}
+            # 조사 대응: 정확 일치 또는 전방일치(문서 토큰이 질문 토큰의 접두)로 겹침 판정.
+            # 단, 1글자 토큰은 정확 일치만 인정한다 ("전"이 "전망은"에 걸리는 오탐 차단).
+            def _hit(t: str) -> bool:
+                if len(t) < 2:
+                    return t in q_toks
+                return any(qt == t or qt.startswith(t) or t.startswith(qt) for qt in q_toks)
+            inter = {t for t in d_toks if _hit(t)}
             if len(inter) >= 2 or any(len(t) >= 3 for t in inter):
                 lex_strong = True
                 break
@@ -758,16 +850,35 @@ class LocalPack:
                     "manifest_hash": self.manifest_hash,
                     "message": "이 팩에는 질문을 뒷받침할 로컬 근거가 없습니다. "
                                "일반 지식/클라우드로 대체하지 마세요."}
-        seeds = [nid for nid, _ in ranked[:4]]
+        seeds = [nid for nid, _ in ranked[:(6 if causal else 4)]]
         visited, gtrace = self.expand(seeds, 3)
+        ctrace: list[dict] = []
+        if causal:
+            cvisited, ctrace = self.causal_expand(seeds)
+            visited |= cvisited
+            # 그래프를 제3의 RRF 축으로 합류시킨다: 인과 답변의 보완축이지 장식이 아니다.
+            corder, seen_c = [], set()
+            for t in ctrace:
+                if t["to"] not in seen_c:
+                    seen_c.add(t["to"])
+                    corder.append(t["to"])
+            for i, nid in enumerate(corder):
+                score[nid] = score.get(nid, 0.0) + 1.0 / (RRF_K + i + 1)
+            ranked = sorted(score.items(), key=lambda kv: -kv[1])
         # 발견 순서(시드 -> 가까운 홉부터)로 카드화: 무작위 set 순서로 레버가 잘리는 문제 방지
-        discovery = list(seeds) + [t["to"] for t in gtrace]
+        # 인과 경로 노드를 배관 evidence보다 앞세운다 (top_k를 evidence가 전부 점유하던 문제)
+        # 인과 경로 위의 노드와 그 위에 걸린 Claim·Evidence를 최우선으로 카드화한다.
+        prio = [t["to"] for t in ctrace if t["axis"] == "causal"]
+        prio += [t["to"] for t in ctrace if t["axis"] == "projection"
+                 and (self.nodes.get(t["to"], {}) or {}).get("space") in ("claim", "evidence")]
+        discovery = list(seeds) + prio + [t["to"] for t in ctrace] + [t["to"] for t in gtrace]
         seen_o = set()
         ordered = [n for n in discovery if not (n in seen_o or seen_o.add(n))]
         # 레버는 잘리지 않게 전부 뒤에 보강 (거리순 유지)
         ordered += [n for n in ordered if False]  # noop, 가독성
         lever_tail = [n for n in ordered if self.nodes.get(n, {}).get("space") == "lever"]
-        cards = [c for c in (self.card(n) for n in (ordered[:top_k * 5] + lever_tail)) if c]
+        window = top_k * 5 + (60 if causal else 0)
+        cards = [c for c in (self.card(n) for n in (ordered[:window] + lever_tail)) if c]
         dedup = set()
         cards = [c for c in cards if not (c.get("id") in dedup or dedup.add(c.get("id")))]
         levers = [c for c in cards if c.get("kind") == "node:lever"]
@@ -842,7 +953,15 @@ class LocalPack:
                     qt == t or qt.startswith(t) or t.startswith(qt) for qt in q_toks2))
                 return (inter * 3) - vec_rank.get(l.get("id"), 99) * 0.1
             levers = sorted(levers, key=_lv_score, reverse=True)
-        sources = sorted({e.get("source_id") for e in evs if e.get("source_id")})[:top_k]
+        # source_id가 비어 있는 팩(원문 단일 소스)에서는 evidence 노드의 source_path로 대체
+        src = {e.get("source_id") for e in evs if e.get("source_id")}
+        if not src:
+            src = {e.get("source_path") for e in evs if e.get("source_path")}
+        sources = sorted(s for s in src if s)[:top_k]
+        causal_chains = [{"from": t["from"], "from_label": t.get("from_label"),
+                           "rel": t["rel"], "direction": t["direction"],
+                           "to": t["to"], "to_label": t.get("to_label")}
+                          for t in ctrace if t["axis"] == "causal"]
         self._audit("ask", f"grounded: {question[:80]}")
         vec_best = max((h["cosine"] for h in vec_all), default=0.0)
         # strong은 어휘·의미 이중 확인: 일반 낱말 전방일치만으로 무관 질문이 strong이 되는 오발 방지
@@ -865,15 +984,20 @@ class LocalPack:
             "graph_path": gtrace[:30],
             "matched_levers": levers[:top_k],
             "claims": claims[:top_k],
+            "causal_chains": causal_chains,
             "direct_evidence": evs[:top_k],
             "sources": sources,
             "conditions": [e.get("conditions") for e in evs if e.get("conditions")][:top_k],
             "limitations": [e.get("limitations") for e in evs if e.get("limitations")][:top_k],
             "review_status": {c["id"]: c["review_status"] for c in cards
                                if c.get("id") and c.get("review_status")},
-            "retrieval_trace": {"lexical_hits": lex, "vector_hits": vec[:5],
+            "retrieval_trace": {"lexical_hits": lex[:8], "vector_hits": vec[:5],
                                  "graph_path": gtrace[:30],
-                                 "rerank": f"lexical rank + vector rank(+2 boost), cosine>={thr} ({self.embed_model} 실측 캘리브레이션)"},
+                                 "causal_path": ctrace[:40],
+                                 "question_intent": "causal" if causal else "factual",
+                                 "rerank": f"RRF(k={RRF_K}) over lexical+vector"
+                                           + ("+causal-graph" if causal else "")
+                                           + f", cosine>={thr} ({self.embed_model} 실측 캘리브레이션)"},
             "local_pack_id": self.pack_id,
             "manifest_hash": self.manifest_hash,
             "governance": {"decision_core": "local_validation_required",
