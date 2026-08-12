@@ -49,9 +49,9 @@ _INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 �
   저작 버퍼 전용입니다. read_only 핸들에 ontology_query를 쓰면 그래프가 비어 나옵니다.
   다른 MCP 서버(유크라테스 엔진)의 query_bm25 등은 팩(zip)과 무관하니 팩 질문에 쓰지 마세요.
 - 팩 경로를 모르거나 열기에 실패하면 pack_list_local()로 팩 서랍(홈에서 자동 탐색)을
-  스캔해 최신 zip을 고르세요. 경로 암기가 필요 없습니다.
-- 환경변수 YUPACK_AUTO_OPEN에 zip 경로(또는 "latest")가 있으면 서버가 시작할 때 그 팩을
-  자동으로 엽니다 - 팩 하나를 플러그인처럼 붙일 때 쓰세요. auto_open_status 리소스 참조.
+  스캔하세요. verified_final_packs만 정본 후보이며, improved/request/draft ZIP은 자동 선택하지 않습니다.
+- 환경변수 YUPACK_AUTO_OPEN에 zip 경로 또는 "library"가 있으면 서버가 시작할 때 엽니다.
+  library에 정본이 여러 개면 작품을 추측해 열지 않고 선택 후보를 돌려줍니다.
 - 팩 서랍의 PACK-CHARTER.md(팩 생산 헌장)는 저장 시 자동 동봉됩니다. 저작 전에 한 번 읽으세요.
 - 임베딩: OPENAI_API_KEY가 있으면 OpenAI, 없어도 qmd가 설치돼 있으면 자동으로 로컬
   임베딩(EmbeddingGemma, 무료·무키)으로 벡터 검색이 켜집니다. 둘 다 없으면 어휘+그래프로 동작합니다.
@@ -1000,20 +1000,88 @@ def _hydrate_from_zip(zip_path: str, pack: str | None = None) -> dict:
 _AUTO_OPENED: dict = {}
 
 
+_NON_FINAL_PACK_MARKERS = ("archive", "improved", "request", "draft", "test", "retrofit")
+
+
+def _is_final_pack_path(path: str) -> bool:
+    """정본 후보 이름만 통과시킨다. 수정시각은 정본성의 증거가 아니다."""
+    name = Path(path).stem.lower()
+    return "final" in name and not any(marker in name for marker in _NON_FINAL_PACK_MARKERS)
+
+
+def _zip_integrity_ok(path: str) -> bool:
+    """ZIP 내부 integrity.json의 파일 해시가 모두 맞는 정본만 자동 선택한다."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = {n for n in z.namelist() if not n.startswith("__MACOSX/") and "/._" not in n}
+            integrity_paths = [n for n in names if n.endswith("integrity.json")]
+            for integrity_path in integrity_paths:
+                root = integrity_path[: -len("integrity.json")]
+                integrity = json.loads(z.read(integrity_path))
+                hashes = integrity.get("sha256") or {}
+                if not hashes:
+                    continue
+                if all(
+                    rel == "runtime/ontology.sqlite" or
+                    (root + rel in names and hashlib.sha256(z.read(root + rel)).hexdigest() == want)
+                    for rel, want in hashes.items()
+                ):
+                    return True
+    except (OSError, zipfile.BadZipFile, KeyError, TypeError, json.JSONDecodeError):
+        return False
+    return False
+
+
+def _verified_final_pack_paths(directory: str) -> list[str]:
+    """경량 실험 ZIP이 아닌, 무결성 검증된 final ZIP만 최신순으로 돌려준다."""
+    import glob as _glob
+    paths = [
+        path for path in _glob.glob(os.path.join(directory, "**", "*.zip"), recursive=True)
+        if "_archive" not in path and os.path.isfile(path)
+        and _is_final_pack_path(path) and _zip_integrity_ok(path)
+    ]
+    return sorted(paths, key=os.path.getmtime, reverse=True)
+
+
+def _open_verified_final_library() -> dict:
+    """정본 하나면 열고, 여러 작품이면 잘못 고르지 않고 선택 정보를 돌려준다."""
+    global _AUTO_OPENED
+    candidates = _discover_pack_dirs()
+    if not candidates:
+        _AUTO_OPENED = {"error": "정본 팩 서랍을 자동 탐색하지 못했습니다."}
+        return _AUTO_OPENED
+    if len(candidates) > 1:
+        _AUTO_OPENED = {"error": "정본 팩 서랍 후보가 여러 개입니다.", "candidates": candidates}
+        return _AUTO_OPENED
+    paths = _verified_final_pack_paths(candidates[0])
+    if not paths:
+        _AUTO_OPENED = {"error": "무결성 검증을 통과한 final 팩이 없습니다.", "directory": candidates[0]}
+        return _AUTO_OPENED
+    if len(paths) > 1:
+        _AUTO_OPENED = {
+            "status": "pack_selection_needed",
+            "directory": candidates[0],
+            "verified_final_packs": paths,
+            "hint": "질문 속 작품명에 맞는 path를 pack_open_local로 열고 다시 질문하세요.",
+        }
+        return _AUTO_OPENED
+    from . import local_pack
+    result = local_pack.open_local(paths[0], "read_only")
+    _AUTO_OPENED = {"mode": "verified_final", "directory": candidates[0],
+                    "pack_handle": result["pack_handle"], "path": paths[0]}
+    return _AUTO_OPENED
+
+
 def _auto_open_on_start():
-    """YUPACK_AUTO_OPEN=<zip|latest> 면 서버 기동 시 팩을 자동으로 연다 (팩 플러그인화)."""
+    """YUPACK_AUTO_OPEN=<zip|library|latest>로 팩을 자동으로 연다."""
     global _AUTO_OPENED
     target = os.environ.get("YUPACK_AUTO_OPEN")
     if not target or _AUTO_OPENED:
         return
     try:
-        if target == "latest":
-            r = pack_list_local()
-            packs = r.get("packs") or []
-            if not packs:
-                _AUTO_OPENED = {"error": "팩 서랍이 비어 있습니다."}
-                return
-            target = packs[0]["path"]
+        if target in {"latest", "library"}:
+            _open_verified_final_library()
+            return
         from . import local_pack
         r = local_pack.open_local(os.path.expanduser(target), "read_only")
         _AUTO_OPENED = {"pack_handle": r["pack_handle"], "path": target}
@@ -1023,9 +1091,9 @@ def _auto_open_on_start():
 
 @mcp.tool()
 def auto_open_status() -> dict:
-    """YUPACK_AUTO_OPEN으로 자동 오픈된 팩의 핸들·경로를 반환한다 (없으면 안내)."""
+    """자동 오픈된 정본 팩 라이브러리의 핸들·경로를 반환한다."""
     _auto_open_on_start()
-    return _AUTO_OPENED or {"status": "자동 오픈 설정 없음 (YUPACK_AUTO_OPEN 미설정)"}
+    return _AUTO_OPENED or {"status": "아직 열린 팩이 없습니다. 첫 질의 때 정본 라이브러리를 자동으로 엽니다."}
 
 
 def _discover_pack_dirs() -> list[str]:
@@ -1093,7 +1161,8 @@ def pack_list_local(directory: str = "") -> dict:
                       "modified": datetime.datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")})
     packs.sort(key=lambda x: x["modified"], reverse=True)
     return {"directory": d, "count": len(packs), "packs": packs,
-            "hint": "최신 팩을 pack_open_local(path)로 여세요."}
+            "verified_final_packs": _verified_final_pack_paths(d),
+            "hint": "정본은 verified_final_packs에만 들어갑니다. 첫 pack_ask_local 질의는 이 라이브러리를 자동으로 엽니다."}
 
 
 @mcp.tool()
@@ -1135,7 +1204,7 @@ def pack_status(pack_handle: str) -> dict:
 def pack_ask_local(question: str, pack_handle: str = "", top_k: int = 6) -> dict:
     """열린 로컬 팩에 질의한다. lexical+vector+graph 3중 검색, 근거 카드와
     retrieval_trace를 반환하며 근거가 없으면 no_local_evidence를 반환한다.
-    pack_handle을 생략하면 YUPACK_AUTO_OPEN 팩 또는 마지막으로 연 팩을 쓴다.
+    pack_handle을 생략하면 열린 팩을 쓰며, 정본이 하나뿐이면 자동으로 연다.
     에이전트 개발·MCP·메모리·프롬프트 인젝션·회귀 질문이면 답하기 전에 먼저 호출할 것."""
     from . import local_pack
     if pack_handle:
@@ -1144,6 +1213,10 @@ def pack_ask_local(question: str, pack_handle: str = "", top_k: int = 6) -> dict
             return {"error": f"핸들 없음: {pack_handle}"}
         return pk.ask(question, top_k)
     _auto_open_on_start()
+    if not local_pack._HANDLES:
+        selection = _open_verified_final_library()
+        if selection.get("status") == "pack_selection_needed":
+            return selection
     return local_pack.ask_all(question, top_k)
 
 
