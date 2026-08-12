@@ -26,9 +26,9 @@ _INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 �
 온톨로지 팩(노드·엣지)을 만들고 zip 하나로 주고받는 개인용 공방입니다.
 
 데이터 취급:
-- 모든 처리가 이 로컬 프로세스 안에서만 일어납니다. 외부로 전송하지 않습니다.
 - 쓰기는 로컬 팩 버퍼와 로컬 SQLite에만 갑니다. 외부 프로덕션 DB에는 쓰지 않습니다(읽기 전용 조회만).
-- 네트워크 호출이 없으므로 노트 본문·팩 내용이 외부 API로 나갈 일이 없습니다.
+- API 키가 없는 기본 모드에서는 노트 본문을 외부 API로 보내지 않습니다. 사용자가 OPENAI_API_KEY를
+  명시적으로 제공한 선택 모드에서만 임베딩·자동추출 요청이 OpenAI로 전송될 수 있습니다.
 
 온톨로지 그래머(중요 — 위반은 입력 시점에 거부됩니다):
 - 노드 타입과 관계는 ontology_manifest의 그래머로 강제됩니다. 선언되지 않은 노드 타입,
@@ -53,8 +53,13 @@ _INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 �
 - 환경변수 YUPACK_AUTO_OPEN에 zip 경로 또는 "library"가 있으면 서버가 시작할 때 엽니다.
   library에 정본이 여러 개면 작품을 추측해 열지 않고 선택 후보를 돌려줍니다.
 - 팩 서랍의 PACK-CHARTER.md(팩 생산 헌장)는 저장 시 자동 동봉됩니다. 저작 전에 한 번 읽으세요.
-- 임베딩: OPENAI_API_KEY가 있으면 OpenAI, 없어도 qmd가 설치돼 있으면 자동으로 로컬
-  임베딩(EmbeddingGemma, 무료·무키)으로 벡터 검색이 켜집니다. 둘 다 없으면 어휘+그래프로 동작합니다.
+- 임베딩: OPENAI_API_KEY가 있으면 정본과 같은 OpenAI 벡터를 쓰고, 키가 없으면 qmd가
+  설치된 경우 자동으로 로컬 임베딩(EmbeddingGemma, 무료·무키)을 씁니다. 둘 다 없으면
+  어휘+그래프로 동작합니다.
+- 무키 저작: 원문에서 노드·관계를 자동 추출하는 외부 API 호출은 하지 않습니다. 이때는
+  팩 생성 보조 도구가 원문 묶음을 근거 노드로 넣고 `needs_host_extraction`을 돌려줍니다.
+  호출한 대화 모델이 반환된 원문을 읽어 ontology_add_node/ontology_add_edge로 구조화합니다.
+  "API 키 없음" 오류로 작업을 끝내지 마세요.
 - 답변 규율: 팩 근거로 말하는 문장에는 근거 id를 표기하고, 팩에 없는 배경지식으로 보충할 때는
   그 부분이 '일반 지식'임을 구분해 밝히세요. 팩 근거와 일반 지식을 한 문장에 섞지 마세요.
   팩이 no_local_evidence를 반환하면 "팩에는 근거가 없다"부터 말한 뒤에만 일반 지식으로 답하세요.
@@ -79,6 +84,9 @@ MANIFEST: dict = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
 # pack_name -> {"nodes": {node_id: node_dict}, "edges": [...], "schema_packs": [...]}
 PACKS: dict[str, dict] = {}
 DEFAULT_PACK = "내팩"
+# 팩을 만들기 전에 사용자가 명시한 저장 서랍. 경로는 이 컴퓨터의 선택값이지
+# 플러그인 정의나 소스 코드의 하드코딩 값이 아니다.
+PACK_DESTINATIONS: dict[str, str] = {}
 
 _BUNDLES: dict[str, bytes] = {}  # token -> zip bytes (pack_save 다운로드)
 
@@ -576,7 +584,19 @@ def ontology_extract(text: str, pack: str = DEFAULT_PACK, max_nodes: int = 8) ->
         return _ro
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
-        return {"error": "OPENAI_API_KEY 없음: extract는 LLM이 필요합니다."}
+        buf = _get_pack(pack)
+        return {
+            "status": "needs_host_extraction",
+            "pack": pack,
+            "source_text": text[:6000],
+            "max_nodes": max_nodes,
+            "allowed_node_types": _allowed_types_for(buf, "concept"),
+            "allowed_relations": _edge_relations(buf, "concept", "concept") or ["related_to"],
+            "agent_instruction": (
+                "API 키가 없는 로컬 모드입니다. 반환된 source_text만 근거로 핵심 개념을 골라 "
+                "ontology_add_node와 ontology_add_edge를 호출하세요. 원문 밖 지식을 보태지 마세요."
+            ),
+        }
     import urllib.request  # openai 패키지 없이 표준 라이브러리로 호출
     buf = _get_pack(pack)
     allowed_rel = _edge_relations(buf, "concept", "concept") or ["related_to"]
@@ -935,6 +955,11 @@ def pack_build_queryable(source_zip: str, out_zip: str | None = None,
     _ro = _read_only_block()
     if _ro:
         return _ro
+    if not out_zip:
+        return {
+            "status": "needs_output_path",
+            "ask_user": "질의 가능 팩 zip을 어느 폴더에 저장할까요? 원하는 팩 서랍 경로를 알려주세요.",
+        }
     from . import local_pack
     return local_pack.build_queryable(source_zip, out_zip, include_embeddings)
 
@@ -1284,22 +1309,33 @@ def pack_set_default(zip_path: str) -> dict:
 
 
 @mcp.tool()
-def pack_create(pack: str) -> dict:
+def pack_create(pack: str, save_to: str | None = None) -> dict:
     """새 팩 버퍼를 만든다 (이후 add_node/ingest/extract로 채우고 pack_save로 내보낸다).
 
-    같은 이름이 이미 있으면 오류가 아니라 현황을 돌려준다 (이어서 작업 가능).
+    새 팩의 저장 서랍은 반드시 사용자가 먼저 정한다. save_to 없이 호출하면 버퍼나 폴더를
+    임의로 만들지 않고 물어볼 문구를 반환한다. 같은 이름이 이미 있으면 오류가 아니라
+    현황을 돌려준다 (이어서 작업 가능).
     """
     _ro = _read_only_block()
     if _ro:
         return _ro
+    if not save_to:
+        return {
+            "status": "needs_save_path",
+            "ask_user": "새 팩을 어느 폴더에 저장할까요? 본인 옵시디언 볼트의 팩 폴더 경로를 알려주세요.",
+        }
+    destination = os.path.expanduser(save_to)
     if pack in PACKS:
         buf = PACKS[pack]
         return {"created": False, "exists": pack,
                 "nodes": len(buf["nodes"]), "edges": len(buf["edges"]),
                 "custom_types": buf.get("custom_types", {}),
+                "save_to": PACK_DESTINATIONS.get(pack, destination),
                 "hint": "기존 팩입니다. 그대로 add_node/ingest로 이어서 작업하거나, 다른 이름으로 새로 만드세요."}
     _get_pack(pack)
-    return {"created": pack, "stores": {"buffer": "ok", "sqlite": _persist(pack)}}
+    PACK_DESTINATIONS[pack] = destination
+    return {"created": pack, "save_to": destination,
+            "stores": {"buffer": "ok", "sqlite": _persist(pack)}}
 
 
 @mcp.tool()
@@ -1319,9 +1355,6 @@ def pack_ingest_local_zip(zip_path: str, pack: str = DEFAULT_PACK,
     if not os.path.exists(zip_path):
         return {"error": f"zip이 없습니다: {zip_path}",
                 "hint": "경로가 바뀌었을 수 있습니다. pack_list_local()로 현재 팩 목록을 확인하세요."}
-    if not os.environ.get("OPENAI_API_KEY"):
-        return {"error": "OPENAI_API_KEY 없음: 대량 추출은 LLM이 필요합니다. "
-                          "임베딩만 있는 팩이 필요하면 build 스크립트로 만든 정본을 pack_import 하세요."}
     z = zipfile.ZipFile(zip_path)
     mds = [n for n in z.namelist()
            if n.lower().endswith((".md", ".markdown", ".txt"))
@@ -1331,6 +1364,37 @@ def pack_ingest_local_zip(zip_path: str, pack: str = DEFAULT_PACK,
     if not mds:
         return {"error": "zip 안에 md/txt 파일이 없습니다."}
     _get_pack(pack)
+    # 키 없는 플러그인에서도 원문 보존과 팩 저작은 시작할 수 있어야 한다.
+    # 자동 추출 대신 호출한 대화 모델에게 한 문서씩 구조화를 맡긴다.
+    if not os.environ.get("OPENAI_API_KEY"):
+        source_ids = []
+        buf = _get_pack(pack)
+        for name in mds:
+            try:
+                text = z.read(name).decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+            if not text.strip():
+                continue
+            src_id = f"src:{_safe_filename(os.path.basename(name))[:40]}"
+            prev = buf["nodes"].get(src_id)
+            if prev and prev.get("properties", {}).get("source_locator") != name:
+                src_id = f"{src_id}-{hashlib.sha256(name.encode()).hexdigest()[:6]}"
+            buf["nodes"][src_id] = {
+                "space": "evidence", "node_type": "TextUnit",
+                "properties": {"label": os.path.basename(name), "text": text[:12000],
+                               "source_locator": name, "source_id": src_id}}
+            source_ids.append(src_id)
+        return {
+            "status": "needs_host_extraction",
+            "pack": pack,
+            "ingested_files": len(source_ids),
+            "source_ids": source_ids,
+            "stores": {"buffer": "ok", "sqlite": _persist(pack)},
+            "next": ("pack_authoring_sources(pack=..., cursor=0)로 원문을 한 문서씩 받고, "
+                     "그 원문만 근거로 ontology_add_node/ontology_add_edge를 호출하세요. "
+                     "모두 구조화한 뒤 pack_qa와 pack_save를 호출하세요."),
+        }
     done, nodes_added, edges_added, errors = 0, 0, 0, 0
     for name in mds:
         try:
@@ -1378,6 +1442,39 @@ def pack_list() -> dict:
                "custom_relation_pairs": len(p.get("custom_relations", []))}
         for name, p in PACKS.items()
     }
+
+
+@mcp.tool()
+def pack_authoring_sources(pack: str = DEFAULT_PACK, cursor: int = 0,
+                           limit: int = 1, max_chars: int = 6000) -> dict:
+    """무키 저작용 원문 근거를 한 문서씩 반환한다.
+
+    pack_ingest_local_zip이 needs_host_extraction을 반환한 뒤 사용한다. 호출한 대화 모델은
+    여기서 받은 text만 근거로 노드·엣지를 저작해야 하며, cursor/next_cursor로 다음 문서를 읽는다.
+    """
+    buf = _get_pack(pack)
+    rows = []
+    for nid, node in buf["nodes"].items():
+        if node.get("space") != "evidence":
+            continue
+        props = node.get("properties") or {}
+        if not props.get("source_locator"):
+            continue
+        rows.append({"source_id": nid, "label": props.get("label"),
+                     "locator": props.get("source_locator"), "text": props.get("text", "")})
+    rows.sort(key=lambda x: (x["locator"] or "", x["source_id"]))
+    cursor = max(0, cursor)
+    limit = max(1, min(limit, 3))
+    items = rows[cursor:cursor + limit]
+    for item in items:
+        item["text"] = item["text"][:max(500, min(max_chars, 12000))]
+    next_cursor = cursor + len(items)
+    return {"pack": pack, "total_sources": len(rows), "cursor": cursor,
+            "items": items, "next_cursor": next_cursor if next_cursor < len(rows) else None,
+            "agent_instruction": (
+                "각 text는 팩 안 원문 근거다. 이 텍스트에서만 개념·사건·주장을 추출해 "
+                "ontology_add_node/ontology_add_edge로 넣고, 만든 노드에는 evidence_refs에 source_id를 남기세요."
+            )}
 
 
 @mcp.tool()
@@ -1470,7 +1567,9 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
               "contract_files": list(contract.keys()),
               "qa_status": qa["status"], "qa_issues": qa["counts"]["issues"]}
     emb = r.get("embeddings") or {}
-    if not (isinstance(emb, dict) and emb.get("count")):
+    embedding_ready = (isinstance(emb, dict) and emb.get("count")) or \
+        (isinstance(emb, str) and emb.startswith(("qmd(", "included(")))
+    if not embedding_ready:
         result["embedding_warning"] = ("임베딩 0개로 저장됐습니다. 한국어 등 의미(벡터) 질의가 "
                                         "약해집니다. include_embeddings=true와 OPENAI_API_KEY "
                                         "설정을 확인한 뒤 다시 저장하는 것을 권장합니다.")
@@ -1479,7 +1578,8 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
                                 "pack_qa로 확인 후 수정하고 다시 저장하는 것을 권장합니다.")
     is_server = bool(os.environ.get("RAILWAY_PUBLIC_DOMAIN"))
     # 로컬 모드에서 저장 경로 미지정 -> 저장하지 않고 사용자에게 경로를 묻게 한다
-    if not save_to and not is_server:
+    destination = save_to or PACK_DESTINATIONS.get(pack)
+    if not destination and not is_server:
         result["status"] = "needs_save_path"
         result["ask_user"] = "압축파일(팩)을 어느 폴더에 저장할까요? 옵시디언 볼트의 팩 폴더 경로를 알려주세요."
         return result
@@ -1490,10 +1590,10 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
         result["note"] = "서버 모드: 다운로드 후 로컬 팩 폴더로 옮기세요."
         return result
     # 로컬: 사용자가 준 경로 아래에 팩별 폴더를 유팩이 만들어 저장
-    base = os.path.expanduser(save_to)
+    base = os.path.expanduser(destination)
     pack_dir = os.path.join(base, f"{_safe_filename(pack)}-{today}")
     os.makedirs(pack_dir, exist_ok=True)
-    dest = os.path.join(pack_dir, "pack.zip")
+    dest = os.path.join(pack_dir, f"{_safe_filename(pack)}-pack-final-{today}.zip")
     with open(dest, "wb") as fh:
         fh.write(data)
     result["saved_to"] = dest

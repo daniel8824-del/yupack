@@ -425,7 +425,8 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
         "storage": "vector-index/vectors.bin (float32 row-major)",
         "per_row_text_sha256": "vector-index/vector-metadata.jsonl",
         "corpus_sha256": _sha256(b"".join(m["text_sha256"].encode() for m in emb_meta)) if emb_meta else None,
-        "query_runtime": "로컬 OMLX bge-m3(127.0.0.1:8000), 미가동 시 lexical+graph 폴백",
+        "query_runtime": ("정본 벡터 모델과 같은 런타임을 우선 사용. 키가 없으면 qmd "
+                          "EmbeddingGemma 로컬 검색, 그것도 없으면 lexical+graph 폴백"),
     }, ensure_ascii=False, indent=1).encode()
     files["query-contract.json"] = json.dumps({
         "discovery_layer": "search_only",
