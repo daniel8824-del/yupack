@@ -48,7 +48,7 @@ _INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 �
 - 도구 구분: 열린 zip 질의는 pack_ask_local(3중 검색 + graph_path), ontology_query는
   저작 버퍼 전용입니다. read_only 핸들에 ontology_query를 쓰면 그래프가 비어 나옵니다.
   다른 MCP 서버(유크라테스 엔진)의 query_bm25 등은 팩(zip)과 무관하니 팩 질문에 쓰지 마세요.
-- 팩 경로를 모르거나 열기에 실패하면 pack_list_local()로 팩 서랍(기본 ~/Zettelkasten/70_Ontology)을
+- 팩 경로를 모르거나 열기에 실패하면 pack_list_local()로 팩 서랍(홈에서 자동 탐색)을
   스캔해 최신 zip을 고르세요. 경로 암기가 필요 없습니다.
 - 환경변수 YUPACK_AUTO_OPEN에 zip 경로(또는 "latest")가 있으면 서버가 시작할 때 그 팩을
   자동으로 엽니다 - 팩 하나를 플러그인처럼 붙일 때 쓰세요. auto_open_status 리소스 참조.
@@ -1028,18 +1028,62 @@ def auto_open_status() -> dict:
     return _AUTO_OPENED or {"status": "자동 오픈 설정 없음 (YUPACK_AUTO_OPEN 미설정)"}
 
 
+def _discover_pack_dirs() -> list[str]:
+    """팩 서랍 후보를 사용자 홈에서 자동 탐색한다.
+
+    경로는 사람마다 다르다. 특정인의 볼트 경로를 코드에 박지 않고,
+    흔한 위치에서 팩이 실제로 들어 있는 디렉토리만 골라 돌려준다.
+    """
+    import glob as _glob
+    home = os.path.expanduser("~")
+    seeds = [
+        os.path.join(home, "*", "70_Ontology"),
+        os.path.join(home, "*", "*", "70_Ontology"),
+        os.path.join(home, "Documents", "*", "70_Ontology"),
+        os.path.join(home, "Desktop", "*", "70_Ontology"),
+        # iCloud Obsidian
+        os.path.join(home, "Library", "Mobile Documents", "iCloud~md~obsidian",
+                     "Documents", "*", "70_Ontology"),
+        # 볼트 이름을 안 쓰는 사람들: 홈 아래 yupack 전용 서랍
+        os.path.join(home, "yupack-packs"),
+        os.path.join(home, ".local", "share", "yupack", "packs"),
+    ]
+    found = []
+    for pat in seeds:
+        for d in _glob.glob(pat):
+            if os.path.isdir(d) and d not in found:
+                if _glob.glob(os.path.join(d, "**", "*.zip"), recursive=True):
+                    found.append(d)
+    return found
+
+
 @mcp.tool()
 def pack_list_local(directory: str = "") -> dict:
     """팩 서랍을 스캔해 사용 가능한 팩 zip 목록을 반환한다 (최신순).
 
-    directory 생략 시 YUPACK_PACK_DIR, 그것도 없으면 ~/Zettelkasten/70_Ontology.
-    경로를 모를 때는 이 도구부터 호출해 최신 zip을 고르면 된다.
+    directory 생략 시 YUPACK_PACK_DIR, 그것도 없으면 홈에서 자동 탐색한다.
+    설정이 없어도 동작하며, 못 찾으면 사용자에게 물을 문구를 돌려준다.
+    경로를 모를 때는 이 도구부터 호출하면 된다.
     """
     import glob as _glob
-    d = os.path.expanduser(directory or os.environ.get("YUPACK_PACK_DIR")
-                           or "~/Zettelkasten/70_Ontology")
+    d = directory or os.environ.get("YUPACK_PACK_DIR") or ""
+    if d:
+        d = os.path.expanduser(d)
+    else:
+        cands = _discover_pack_dirs()
+        if not cands:
+            return {"packs": [], "searched": "홈 디렉토리 자동 탐색",
+                    "ask_user": "팩 zip이 들어 있는 폴더 경로를 알려주세요. "
+                                "(예: 옵시디언 볼트의 70_Ontology 폴더)",
+                    "hint": "경로를 받으면 pack_list_local(directory=\"<경로>\")로 다시 부르세요."}
+        if len(cands) > 1:
+            return {"candidates": cands, "packs": [],
+                    "ask_user": "팩 서랍 후보가 여러 개입니다. 어느 것을 쓸까요?",
+                    "hint": "고른 경로로 pack_list_local(directory=\"<경로>\")를 부르세요."}
+        d = cands[0]
     if not os.path.isdir(d):
-        return {"error": f"디렉토리가 없습니다: {d}", "packs": []}
+        return {"error": f"디렉토리가 없습니다: {d}", "packs": [],
+                "ask_user": "팩 zip이 들어 있는 폴더 경로를 알려주세요."}
     packs = []
     for f in _glob.glob(os.path.join(d, "**", "*.zip"), recursive=True):
         if "_archive" in f or not os.path.isfile(f):

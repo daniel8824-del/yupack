@@ -244,9 +244,10 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
             files[f"reports/{rep}"] = t.encode()
 
     # 팩 생산 헌장 자동 동봉 (헌장 9조): YUPACK_CHARTER > 팩 서랍의 PACK-CHARTER.md
+    # 서랍 경로는 사람마다 다르다. 설정이 없으면 동봉을 건너뛴다(특정인 경로를 박지 않는다).
+    _dir = os.environ.get("YUPACK_PACK_DIR")
     for cand in (os.environ.get("YUPACK_CHARTER"),
-                 os.path.join(os.path.expanduser(os.environ.get("YUPACK_PACK_DIR")
-                              or "~/Zettelkasten/70_Ontology"), "PACK-CHARTER.md")):
+                 os.path.join(os.path.expanduser(_dir), "PACK-CHARTER.md") if _dir else None):
         if cand and os.path.isfile(os.path.expanduser(cand)):
             files["reports/pack-production-charter.md"] = open(
                 os.path.expanduser(cand), "rb").read()
