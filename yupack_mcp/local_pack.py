@@ -52,7 +52,7 @@ CAUSAL_RELS = {"triggers", "causes", "prevents", "enables", "results_in",
 PROJECT_RELS = {"records", "supports", "characterizes", "about"}
 PLUMBING_RELS = {"contains", "contains_segment"}
 _CAUSAL_Q = re.compile(r"왜|어째서|어찌|무슨 이유|원인|이유|때문|대가|탓|초래|결과적으로"
-                       r"|why|cause|because")
+                       r"|why|cause|because", re.IGNORECASE)
 
 
 def _is_causal_question(q: str) -> bool:
@@ -945,6 +945,18 @@ class LocalPack:
         levers = [c for c in cards if c.get("kind") == "node:lever"]
         claims = [c for c in cards if c.get("kind") == "node:claim"]
         evs = [c for c in cards if c.get("kind") == "evidence"]
+        # 그래프 인덱스가 없거나 관계가 비어 있어도, lexical/vector가 Concept·Claim을
+        # 직접 찾고 그 노드가 evidence_refs를 갖고 있으면 grounded 답변은 가능하다.
+        # 이 경우 근거가 후보 카드 안에만 숨으면 호출자가 locator를 놓칠 수 있으므로
+        # 최상위 direct_evidence에도 같은 카드를 올린다. 그래프 부재는 거절 사유가 아니다.
+        if not evs:
+            seen_evidence = set()
+            for c in cards:
+                for ev in c.get("direct_evidence", []):
+                    eid = ev.get("evidence_id")
+                    if eid and eid not in seen_evidence:
+                        seen_evidence.add(eid)
+                        evs.append(ev)
         # source/evidence 없는 lever는 추천으로 반환하지 않는다 (정책)
         levers = [l for l in levers if l.get("direct_evidence") or l.get("evidence_refs")]
         # 레버 보증: grounded인데 3홉 안에 레버가 없으면, 매칭 노드에서 BFS로 가장 가까운 레버를 찾는다
@@ -1023,6 +1035,12 @@ class LocalPack:
                            "rel": t["rel"], "direction": t["direction"],
                            "to": t["to"], "to_label": t.get("to_label")}
                           for t in ctrace if t["axis"] == "causal"]
+        causal_assessment = None
+        if causal and not causal_chains:
+            causal_assessment = {
+                "status": "not_proven_from_local_graph",
+                "message": "관련 로컬 근거는 있으나, 이 팩의 그래프에는 원인-결과 사슬이 확인되지 않습니다. 사실·해석만 답하고 인과를 단정하지 마세요.",
+            }
         self._audit("ask", f"grounded: {question[:80]}")
         vec_best = max((h["cosine"] for h in vec_all), default=0.0)
         # strong은 어휘·의미 이중 확인: 일반 낱말 전방일치만으로 무관 질문이 strong이 되는 오발 방지
@@ -1036,6 +1054,8 @@ class LocalPack:
             guide = ("주의: 이 질문과 팩 근거의 결합이 약합니다(어휘 또는 의미 유사도 부족). "
                      "\"팩에 이 질문의 직접 근거는 뚜렷하지 않다\"를 먼저 밝히고, 후보 중 실제로 "
                      "관련 있는 것만 골라 답하거나 일반 지식으로 구분해 답하세요. ") + guide
+        if causal_assessment:
+            guide = causal_assessment["message"] + " " + guide
         return {
             "status": "grounded",
             "grounding": {"strength": strength, "lexical_match": bool(lex_strong),
@@ -1046,6 +1066,7 @@ class LocalPack:
             "matched_levers": levers[:top_k],
             "claims": claims[:top_k],
             "causal_chains": causal_chains,
+            "causal_assessment": causal_assessment,
             "direct_evidence": evs[:top_k],
             "sources": sources,
             "conditions": [e.get("conditions") for e in evs if e.get("conditions")][:top_k],
