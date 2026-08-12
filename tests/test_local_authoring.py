@@ -1,4 +1,7 @@
+import os
+import tempfile
 import unittest
+import zipfile
 
 from yupack_mcp import server
 
@@ -9,49 +12,63 @@ SOURCE = (
 )
 
 
-class LocalAuthoringTest(unittest.TestCase):
+class HostAuthoringTest(unittest.TestCase):
     def setUp(self):
-        self.old_extract = server._omlx_authoring_extract
+        self.old_destinations = dict(server.PACK_DESTINATIONS)
         server.PACKS.clear()
+        server.PACK_DESTINATIONS.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.source_zip = os.path.join(self.tmp.name, "source.zip")
+        with zipfile.ZipFile(self.source_zip, "w") as z:
+            z.writestr("odyssey.md", SOURCE)
 
     def tearDown(self):
-        server._omlx_authoring_extract = self.old_extract
         server.PACKS.clear()
+        server.PACK_DESTINATIONS.clear()
+        server.PACK_DESTINATIONS.update(self.old_destinations)
+        self.tmp.cleanup()
 
-    def test_local_extraction_keeps_claim_evidence_and_causal_path(self):
-        server._omlx_authoring_extract = lambda text, max_nodes: ({
-            "concepts": [{"label": "오디세우스", "kind": "person"},
-                         {"label": "포세이돈", "kind": "deity"}],
-            "claims": [{"statement": "복수 기도가 귀향 방해로 이어진다.",
-                        "quote": "폴리페모스는 아버지 포세이돈에게 복수를 기도했고, 포세이돈은 그의 귀향을 방해했다."}],
-            "kinetic": [{"label": "복수 기도", "type": "Action",
-                         "quote": "폴리페모스는 아버지 포세이돈에게 복수를 기도했고,"},
-                        {"label": "귀향 방해", "type": "Event",
-                         "quote": "포세이돈은 그의 귀향을 방해했다."}],
-            "causal": [{"from": "복수 기도", "relation": "triggers", "to": "귀향 방해"}],
-            "involves": [{"kinetic": "복수 기도", "concept": "포세이돈"}],
-        }, None)
+    def _ingest(self, pack="host-authored"):
+        server.pack_create(pack, save_to=self.tmp.name)
+        return server.pack_ingest_local_zip(self.source_zip, pack=pack, max_files=1)
 
-        result = server.ontology_extract(SOURCE, pack="test-local", source_id=None)
+    def test_ingest_hands_source_to_host_instead_of_automatic_authoring(self):
+        result = self._ingest()
 
-        self.assertEqual(result["status"], "local_extracted")
-        nodes = server.PACKS["test-local"]["nodes"]
-        claim = next(n for n in nodes.values() if n["space"] == "claim")
-        self.assertTrue(claim["properties"]["evidence_refs"])
-        self.assertIn(result["source_id"], claim["properties"]["evidence_refs"])
-        self.assertTrue(any(e["relation"] == "triggers" for e in server.PACKS["test-local"]["edges"]))
-        self.assertEqual(server.pack_quality("test-local")["status"], "pass")
+        self.assertEqual("needs_host_extraction", result["status"])
+        self.assertEqual(1, result["ingested_files"])
+        self.assertIn("pack_authoring_sources", result["next"])
+        self.assertEqual(1, len(server.PACKS["host-authored"]["nodes"]))
+        self.assertFalse(any(n["space"] in ("claim", "kinetic")
+                             for n in server.PACKS["host-authored"]["nodes"].values()))
 
-    def test_evidence_or_concept_only_pack_cannot_be_saved_as_final(self):
-        server.PACKS["thin"] = {"nodes": {
-            "ev:only": {"space": "evidence", "node_type": "TextUnit",
-                        "properties": {"label": "원문", "text": "근거만 있음"}},
-            "concept:only": {"space": "concept", "node_type": "Entity",
-                             "properties": {"label": "이름만 있음"}},
-        }, "edges": [], "schema_packs": []}
+    def test_save_is_blocked_until_host_marks_grounded_structure_complete(self):
+        self._ingest()
 
-        self.assertEqual(server.pack_quality("thin")["status"], "needs_authoring")
-        self.assertEqual(server.pack_save("thin")["status"], "needs_authoring")
+        result = server.pack_save("host-authored", include_embeddings=False)
+
+        self.assertEqual("needs_authoring_completion", result["status"])
+
+    def test_claim_with_evidence_can_complete_without_kinetic(self):
+        ingested = self._ingest()
+        source_id = ingested["source_ids"][0]
+        server.ontology_add_node(
+            "claim", "Claim", "claim:identity-cost",
+            {"label": "이름 공개는 귀향 지연의 대가였다",
+             "statement": "오디세우스가 이름을 밝힌 일은 귀향 지연의 대가가 되었다.",
+             "evidence_refs": [source_id]},
+            pack="host-authored",
+        )
+        server.ontology_add_edge(
+            "evidence", source_id, "supports", "claim", "claim:identity-cost",
+            pack="host-authored",
+        )
+
+        result = server.pack_authoring_complete("host-authored")
+
+        self.assertEqual("ready_to_save", result["status"])
+        self.assertEqual(0, result["counts"]["kinetic"])
+        self.assertEqual("pass", server.pack_quality("host-authored")["status"])
 
 
 if __name__ == "__main__":

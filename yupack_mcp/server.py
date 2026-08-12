@@ -16,7 +16,6 @@ import sqlite3
 import zipfile
 from pathlib import Path
 from urllib.parse import quote
-from urllib import request as urlrequest
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -57,10 +56,10 @@ _INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 �
 - 임베딩: Yupack의 기본은 로컬 OMLX bge-m3(1024차원)이며 API 키가 필요 없습니다.
   OMLX가 꺼져 있으면 어휘+그래프로만 동작한다고 명시합니다. QMD는 볼트 검색 도구이며
   `YUPACK_EMBED_MODEL=qmd`를 사용자가 명시한 호환 모드에서만 씁니다.
-- 무키 저작: 기본 저작 모델은 로컬 OMLX `nemotron3-nano-30b`입니다. 원문은 컴퓨터 밖으로
-  보내지 않으며, 모델 출력은 관계 문법과 근거 연결을 통과한 노드·엣지만 저장합니다. 로컬
-  저작 모델이 꺼져 있거나 JSON 검증에 실패하면 `needs_host_extraction`으로 멈추며, 근거만 든
-  경량 팩을 완성본처럼 저장하지 않습니다.
+- 무키 저작: 원문을 읽고 구조화하는 저작자는 이 도구를 호출한 ChatGPT/Claude다. 유팩은
+  원문 Evidence를 보존하고, 호스트가 추가한 Claim·Kinetic·관계를 그래머와 근거 연결로
+  검증한다. `pack_authoring_complete`가 통과하기 전에는 ZIP을 저장하지 않는다. OMLX가
+  원문을 대신 읽어 경량 노드를 자동 생성하지 않는다.
 - 답변 규율: 팩 근거로 말하는 문장에는 근거 id를 표기하고, 팩에 없는 배경지식으로 보충할 때는
   그 부분이 '일반 지식'임을 구분해 밝히세요. 팩 근거와 일반 지식을 한 문장에 섞지 마세요.
   팩이 no_local_evidence를 반환하면 "팩에는 근거가 없다"부터 말한 뒤에만 일반 지식으로 답하세요.
@@ -143,6 +142,16 @@ def _persist(pack: str) -> str:
 
 def _get_pack(pack: str) -> dict:
     return PACKS.setdefault(pack, {"nodes": {}, "edges": [], "schema_packs": []})
+
+
+def _begin_host_authoring(buf: dict, source_id: str) -> dict:
+    """원문 묶음은 호스트 저작 완료 전 저장할 수 없도록 상태를 기록한다."""
+    state = buf.setdefault("authoring", {"required": True, "complete": False, "source_ids": []})
+    state["required"] = True
+    state["complete"] = False
+    if source_id not in state.setdefault("source_ids", []):
+        state["source_ids"].append(source_id)
+    return state
 
 
 _load_packs()
@@ -573,180 +582,13 @@ def pack_qa(pack: str = DEFAULT_PACK) -> dict:
     return _qa_scan(pack)
 
 
-def _parse_json_object(raw: str) -> dict | None:
-    """LLM 응답에서 JSON 객체 하나만 안전하게 꺼낸다."""
-    raw = (raw or "").strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\\s*|\\s*```$", "", raw, flags=re.I)
-    try:
-        data = json.loads(raw)
-        return data if isinstance(data, dict) else None
-    except json.JSONDecodeError:
-        start, end = raw.find("{"), raw.rfind("}")
-        if start < 0 or end <= start:
-            return None
-        try:
-            data = json.loads(raw[start:end + 1])
-            return data if isinstance(data, dict) else None
-        except json.JSONDecodeError:
-            return None
-
-
-def _omlx_authoring_extract(text: str, max_nodes: int) -> tuple[dict | None, str | None]:
-    """로컬 OMLX에 제한된 독서팩 초안을 요청한다. 출력은 반드시 아래 검증기를 거친다."""
-    if os.environ.get("YUPACK_LOCAL_AUTHORING", "1").lower() in {"0", "false", "off"}:
-        return None, "로컬 저작이 YUPACK_LOCAL_AUTHORING=0으로 꺼져 있습니다"
-    model = os.environ.get("YUPACK_AUTHORING_MODEL", "nemotron3-nano-30b")
-    endpoint = os.environ.get("YUPACK_OMLX_URL", "http://127.0.0.1:8000/v1/chat/completions")
-    prompt = f'''당신은 인문독서팩의 추출기다. 아래 원문 안에 명시된 내용만 JSON으로 추출하라.
-추측, 일반지식, 원문에 없는 인과는 절대 넣지 마라. 출력은 JSON 객체 하나만 허용한다.
-
-형식:
-{{
-  "concepts": [{{"label":"한국어 이름", "kind":"person|deity|place|object|theme"}}],
-  "claims": [{{"statement":"원문으로 뒷받침되는 짧은 주장", "quote":"원문 그대로의 짧은 근거"}}],
-  "kinetic": [{{"label":"사건·행위·상태", "type":"Action|Event|State", "quote":"원문 그대로의 짧은 근거"}}],
-  "causal": [{{"from":"kinetic label", "relation":"triggers|causes|results_in|precedes", "to":"kinetic label"}}],
-  "involves": [{{"kinetic":"kinetic label", "concept":"concept label"}}]
-}}
-제약:
-- concepts는 최대 {max_nodes}개, claims는 최대 4개, kinetic은 최대 {max_nodes}개다.
-- causal은 원문이 명시적으로 촉발·원인·결과·순서를 말할 때만 넣는다.
-- claim과 kinetic은 근거 quote가 원문에 실제로 들어 있을 때만 넣는다.
-- 사람이 행위를 했다는 사실은 involves에 넣지 말고 kinetic과 concept을 연결할 때만 쓴다.
-
-원문:
-{text[:6000]}'''
-    body = json.dumps({"model": model, "temperature": 0, "max_tokens": 1200,
-                       "chat_template_kwargs": {"enable_thinking": False},
-                       "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
-    try:
-        req = urlrequest.Request(endpoint, body, {"Content-Type": "application/json"})
-        response = json.load(urlrequest.urlopen(req, timeout=120))
-        content = response["choices"][0]["message"]["content"]
-    except Exception as exc:
-        return None, f"로컬 OMLX 저작 모델 호출 실패: {exc}"
-    data = _parse_json_object(content)
-    if not data:
-        return None, "로컬 OMLX 저작 모델이 검증 가능한 JSON을 반환하지 않았습니다"
-    return data, None
-
-
-def _node_id(space: str, label: str) -> str:
-    return f"{space}:{_safe_filename(label)[:56]}"
-
-
-def _grounded_fragment(fragment: str, source_text: str) -> bool:
-    """문장부호·공백 차이만 허용하고, 모델이 원문 밖 라벨을 만들지 못하게 한다."""
-    compact = lambda value: re.sub(r"[\s\W_]+", "", value, flags=re.UNICODE)
-    needle = compact(fragment)
-    return len(needle) >= 2 and needle in compact(source_text)
-
-
-def _upsert_local_authoring(data: dict, source_id: str, pack: str,
-                            max_nodes: int) -> dict:
-    """로컬 모델 초안을 팩 문법과 원문 인용 검증 뒤에만 투영한다."""
-    buf = _get_pack(pack)
-    source = buf["nodes"].get(source_id, {})
-    source_text = str(source.get("properties", {}).get("text", ""))
-    concepts: dict[str, str] = {}
-    kinetics: dict[str, str] = {}
-    added = {"concepts": 0, "claims": 0, "kinetic": 0, "edges": 0}
-    skipped: list[dict] = []
-
-    for item in (data.get("concepts") or [])[:max_nodes]:
-        label = str(item.get("label", "")).strip()
-        if not label or not _grounded_fragment(label, source_text):
-            if label:
-                skipped.append({"concept": label, "reason": "원문에 없는 라벨"})
-            continue
-        nid = _node_id("concept", label)
-        if nid not in buf["nodes"]:
-            buf["nodes"][nid] = {"space": "concept", "node_type": "Entity",
-                                  "properties": {"label": label, "label_ko": label,
-                                                 "aliases_ko": [label],
-                                                 "kind": str(item.get("kind", "entity")),
-                                                 "evidence_refs": [source_id]}}
-            added["concepts"] += 1
-        concepts[label] = nid
-        buf["edges"].append({"from_space": "evidence", "from_id": source_id,
-                             "relation": "mentions", "to_space": "concept", "to_id": nid,
-                             "properties": {}})
-        added["edges"] += 1
-
-    for item in (data.get("kinetic") or [])[:max_nodes]:
-        label = str(item.get("label", "")).strip()
-        kind = str(item.get("type", "Event"))
-        quote = str(item.get("quote", "")).strip()
-        if kind not in {"Action", "Event", "State"}:
-            kind = "Event"
-        if not label or not quote or not _grounded_fragment(quote, source_text):
-            if label:
-                skipped.append({"kinetic": label, "reason": "근거 quote가 원문과 일치하지 않음"})
-            continue
-        nid = _node_id("kinetic", label)
-        if nid not in buf["nodes"]:
-            buf["nodes"][nid] = {"space": "kinetic", "node_type": kind,
-                                  "properties": {"label": label, "label_ko": label,
-                                                 "evidence_quote": quote,
-                                                 "evidence_refs": [source_id]}}
-            added["kinetic"] += 1
-        kinetics[label] = nid
-        buf["edges"].append({"from_space": "evidence", "from_id": source_id,
-                             "relation": "records", "to_space": "kinetic", "to_id": nid,
-                             "properties": {}})
-        added["edges"] += 1
-
-    for item in (data.get("claims") or [])[:4]:
-        statement = str(item.get("statement", "")).strip()
-        quote = str(item.get("quote", "")).strip()
-        if not statement or not quote or not _grounded_fragment(quote, source_text):
-            skipped.append({"claim": statement or "(empty)", "reason": "근거 quote가 원문과 일치하지 않음"})
-            continue
-        nid = _node_id("claim", statement)
-        if nid not in buf["nodes"]:
-            buf["nodes"][nid] = {"space": "claim", "node_type": "Claim",
-                                  "properties": {"label": statement, "statement": statement,
-                                                 "evidence_quote": quote,
-                                                 "evidence_refs": [source_id]}}
-            added["claims"] += 1
-        buf["edges"].append({"from_space": "evidence", "from_id": source_id,
-                             "relation": "supports", "to_space": "claim", "to_id": nid,
-                             "properties": {}})
-        added["edges"] += 1
-
-    causal_allowed = {"triggers", "causes", "results_in", "precedes"}
-    for item in data.get("causal") or []:
-        left, right = str(item.get("from", "")).strip(), str(item.get("to", "")).strip()
-        relation = str(item.get("relation", "")).strip()
-        if left not in kinetics or right not in kinetics or relation not in causal_allowed:
-            skipped.append({"causal": f"{left} -{relation}-> {right}",
-                            "reason": "검증된 kinetic 노드 또는 허용 인과 관계가 없음"})
-            continue
-        buf["edges"].append({"from_space": "kinetic", "from_id": kinetics[left],
-                             "relation": relation, "to_space": "kinetic", "to_id": kinetics[right],
-                             "properties": {"evidence_refs": [source_id]}})
-        added["edges"] += 1
-
-    for item in data.get("involves") or []:
-        kinetic, concept = str(item.get("kinetic", "")).strip(), str(item.get("concept", "")).strip()
-        if kinetic not in kinetics or concept not in concepts:
-            continue
-        buf["edges"].append({"from_space": "kinetic", "from_id": kinetics[kinetic],
-                             "relation": "involves", "to_space": "concept", "to_id": concepts[concept],
-                             "properties": {}})
-        added["edges"] += 1
-    return {"added": added, "skipped": skipped}
-
-
 @mcp.tool()
 def ontology_extract(text: str, pack: str = DEFAULT_PACK, max_nodes: int = 8,
                      source_id: str | None = None) -> dict:
-    """원문에서 근거·주장·사건·인과를 로컬 OMLX로 추출해 문법 검증 뒤 팩에 넣는다.
+    """호스트 저작자에게 원문 Evidence를 돌려준다. 자동 추출·외부 API 호출은 하지 않는다.
 
-    키 없이도 로컬 OMLX 저작 모델을 쓴다. 원문에 없거나 관계 문법에 맞지 않는 출력은
-    저장하지 않으며, OMLX가 없으면 경량 팩을 만들지 않고 needs_host_extraction으로 멈춘다.
-    source_id를 주면 생성된 Claim과 Kinetic에 그 근거를 연결한다.
+    ChatGPT/Claude가 반환된 원문만 근거로 ontology_add_node/ontology_add_edge를 호출한다.
+    source_id를 주면 기존 Evidence를 사용하고, 없으면 새 Evidence를 만든다.
     """
     _ro = _read_only_block()
     if _ro:
@@ -760,19 +602,18 @@ def ontology_extract(text: str, pack: str = DEFAULT_PACK, max_nodes: int = 8,
         }
     elif source_id not in buf["nodes"]:
         return {"error": f"source_id 근거 노드가 팩에 없습니다: {source_id}"}
-
-    data, error = _omlx_authoring_extract(text, max_nodes)
-    if error:
-        return {
-            "status": "needs_host_extraction", "pack": pack, "source_id": source_id,
-            "source_text": text[:6000], "reason": error,
-            "next": "원문을 직접 구조화한 뒤 ontology_add_node/ontology_add_edge로 넣으세요. 경량 팩으로 저장하지 마세요.",
-        }
-    out = _upsert_local_authoring(data, source_id, pack, max_nodes)
-    out.update({"status": "local_extracted", "pack": pack, "source_id": source_id,
-                "authoring_backend": os.environ.get("YUPACK_AUTHORING_MODEL", "nemotron3-nano-30b"),
-                "stores": {"buffer": "ok", "sqlite": _persist(pack)}})
-    return out
+    _begin_host_authoring(buf, source_id)
+    return {
+        "status": "needs_host_extraction", "pack": pack, "source_id": source_id,
+        "source_text": text[:6000], "max_nodes": max_nodes,
+        "agent_instruction": (
+            "당신이 이 원문을 읽는 저작자다. 원문에 있는 내용만 Claim·Concept·Kinetic으로 "
+            "구조화하라. Claim/Kinetic에는 evidence_refs=[source_id]를 넣고, Evidence→Claim은 "
+            "supports, Evidence→Kinetic은 records로 연결하라. 인과는 원문이 명시할 때만 넣는다. "
+            "모든 원문을 처리한 뒤 pack_authoring_complete를 호출해야만 저장할 수 있다."
+        ),
+        "stores": {"buffer": "ok", "sqlite": _persist(pack)},
+    }
 
 
 @mcp.tool()
@@ -1466,11 +1307,11 @@ def pack_create(pack: str, save_to: str | None = None) -> dict:
 @mcp.tool()
 def pack_ingest_local_zip(zip_path: str, pack: str = DEFAULT_PACK,
                            max_files: int = 0, max_nodes_per_file: int = 6) -> dict:
-    """로컬 md 묶음을 근거·주장·사건·인과를 갖춘 질의용 팩으로 누적한다.
+    """로컬 md 묶음을 Evidence로 보존하고 호스트 저작 단계를 시작한다.
 
-    기본은 키 없는 로컬 OMLX 저작이다. 각 파일은 Evidence로 먼저 보존한 뒤 그 Evidence에
-    연결되는 Concept·Claim·Kinetic을 추출한다. OMLX가 꺼진 경우에는 완성본처럼 저장하지
-    않고 needs_host_extraction으로 멈춘다. max_files=0이면 전부다.
+    이 도구는 원문을 자동 요약·추출하지 않는다. 호출한 ChatGPT/Claude가
+    pack_authoring_sources로 원문을 읽고 Claim·Concept·Kinetic·관계를 작성한다.
+    pack_authoring_complete 전에는 pack_save가 ZIP 생성을 거절한다.
     """
     _ro = _read_only_block()
     if _ro:
@@ -1488,8 +1329,7 @@ def pack_ingest_local_zip(zip_path: str, pack: str = DEFAULT_PACK,
     if not mds:
         return {"error": "zip 안에 md/txt 파일이 없습니다."}
     _get_pack(pack)
-    done, nodes_added, edges_added, errors = 0, 0, 0, 0
-    extraction_stops = []
+    done, errors, source_ids = 0, 0, []
     for name in mds:
         try:
             text = z.read(name).decode("utf-8", errors="ignore")
@@ -1508,30 +1348,20 @@ def pack_ingest_local_zip(zip_path: str, pack: str = DEFAULT_PACK,
             "space": "evidence", "node_type": "TextUnit",
             "properties": {"label": os.path.basename(name), "text": text[:12000],
                             "source_locator": name, "source_id": src_id}}
-        nodes_added += 1
-        r = ontology_extract(text=text, pack=pack, max_nodes=max_nodes_per_file, source_id=src_id)
-        if r.get("status") == "needs_host_extraction" or "error" in r:
-            errors += 1
-            extraction_stops.append({"source_id": src_id, "locator": name,
-                                     "reason": r.get("reason") or r.get("error")})
-        else:
-            added = r.get("added", {})
-            nodes_added += added.get("concepts", 0) + added.get("claims", 0) + added.get("kinetic", 0)
-            edges_added += added.get("edges", 0)
+        _begin_host_authoring(buf, src_id)
+        source_ids.append(src_id)
         done += 1
-    qa = _qa_scan(pack)
-    result = {"ingested_files": done, "total_files": len(mds),
-            "nodes_added": nodes_added, "edges_added": edges_added, "errors": errors,
-            "qa_status": qa["status"], "qa_issues": qa["counts"]["issues"],
-            "stores": {"buffer": "ok", "sqlite": _persist(pack)},
-            "next": ("pack_qa로 위반을 확인·수정한 뒤 " if qa["status"] != "pass" else "")
-                    + f"pack_save(pack=\"{pack}\", save_to=\"<폴더>\")로 질의 가능 팩을 저장하세요."}
-    if extraction_stops:
-        result.update({"status": "needs_host_extraction", "extraction_stops": extraction_stops,
-                       "next": "로컬 저작 모델이 멈췄습니다. 이 상태의 Evidence-only 팩은 저장하지 마세요."})
-    else:
-        result["status"] = "local_extracted"
-    return result
+    return {
+        "status": "needs_host_extraction", "pack": pack,
+        "ingested_files": done, "total_files": len(mds), "errors": errors,
+        "source_ids": source_ids,
+        "stores": {"buffer": "ok", "sqlite": _persist(pack)},
+        "next": (
+            "pack_authoring_sources(pack=..., cursor=0)로 원문을 읽고, 원문마다 "
+            "ontology_add_node/ontology_add_edge로 구조화하세요. Claim 또는 Kinetic은 반드시 "
+            "Evidence와 연결하세요. 완료 뒤 pack_authoring_complete를 호출해야 ZIP을 저장할 수 있습니다."
+        ),
+    }
 
 
 @mcp.tool()
@@ -1575,8 +1405,60 @@ def pack_authoring_sources(pack: str = DEFAULT_PACK, cursor: int = 0,
             "items": items, "next_cursor": next_cursor if next_cursor < len(rows) else None,
             "agent_instruction": (
                 "각 text는 팩 안 원문 근거다. 이 텍스트에서만 개념·사건·주장을 추출해 "
-                "ontology_add_node/ontology_add_edge로 넣고, 만든 노드에는 evidence_refs에 source_id를 남기세요."
+                "ontology_add_node/ontology_add_edge로 넣고, 만든 Claim/Kinetic에는 evidence_refs에 source_id를 남기세요."
             )}
+
+
+def _authoring_coverage(buf: dict) -> tuple[list[str], list[str]]:
+    """원문 Evidence가 Claim 또는 Kinetic에 실제로 투영됐는지 확인한다."""
+    state = buf.get("authoring") or {}
+    source_ids = list(state.get("source_ids") or [])
+    covered: set[str] = set()
+    for node in buf["nodes"].values():
+        if node.get("space") in {"claim", "kinetic"}:
+            covered.update(node.get("properties", {}).get("evidence_refs") or [])
+    for edge in buf["edges"]:
+        if edge.get("from_space") != "evidence" or edge.get("relation") not in {"supports", "records"}:
+            continue
+        target = buf["nodes"].get(edge.get("to_id")) or {}
+        if target.get("space") in {"claim", "kinetic"}:
+            covered.add(edge.get("from_id"))
+    return source_ids, sorted(set(source_ids) & covered)
+
+
+@mcp.tool()
+def pack_authoring_complete(pack: str = DEFAULT_PACK) -> dict:
+    """호스트 저작의 근거 연결·그래머를 검증하고, 통과한 팩만 저장 가능으로 표시한다."""
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
+    buf = _get_pack(pack)
+    state = buf.get("authoring")
+    if not state or not state.get("required"):
+        return {"status": "not_required", "pack": pack,
+                "note": "원문 ZIP ingest로 시작한 팩이 아닙니다. pack_quality와 pack_qa를 확인하세요."}
+    quality = _authoring_quality(buf)
+    source_ids, covered = _authoring_coverage(buf)
+    missing = sorted(set(source_ids) - set(covered))
+    qa = _qa_scan(pack)
+    counts = quality["counts"]
+    if quality["status"] != "pass" or missing or qa["status"] != "pass":
+        state["complete"] = False
+        return {
+            "status": "needs_authoring", "pack": pack, "counts": counts,
+            "uncovered_source_ids": missing,
+            "qa_status": qa["status"], "qa_issues": qa["counts"]["issues"],
+            "next": (
+                "각 원문 Evidence를 Claim 또는 Kinetic에 evidence_refs로 연결하고, "
+                "Evidence→Claim supports 또는 Evidence→Kinetic records 엣지를 추가하세요. "
+                "Kinetic은 원문에 사건·인과가 있을 때만 필요하며, 논증형 팩은 Claim만으로 통과합니다."
+            ),
+        }
+    state["complete"] = True
+    return {"status": "ready_to_save", "pack": pack, "counts": counts,
+            "covered_source_ids": covered,
+            "qa_status": qa["status"],
+            "stores": {"buffer": "ok", "sqlite": _persist(pack)}}
 
 
 def _authoring_quality(buf: dict) -> dict:
@@ -1585,7 +1467,7 @@ def _authoring_quality(buf: dict) -> dict:
     Kinetic은 작품 유형에 따라 없을 수 있다(논증서 등). 따라서 kinetic 부재를 답변 거절의
     조건으로 삼지 않는다. 대신 원문 Evidence 외에 하나의 구조 노드도 없는 경우만 실패다.
     """
-    counts: dict[str, int] = {}
+    counts: dict[str, int] = {space: 0 for space in MANIFEST["spaces"]}
     for node in buf["nodes"].values():
         space = node.get("space", "unknown")
         counts[space] = counts.get(space, 0) + 1
@@ -1628,10 +1510,19 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
     buf = _get_pack(pack)
     if not buf["nodes"]:
         return {"error": f"팩이 비어 있습니다: {pack}"}
+    authoring = buf.get("authoring") or {}
+    if authoring.get("required") and not authoring.get("complete"):
+        source_ids, covered = _authoring_coverage(buf)
+        return {
+            "status": "needs_authoring_completion", "pack": pack,
+            "source_ids": source_ids,
+            "uncovered_source_ids": sorted(set(source_ids) - set(covered)),
+            "next": "호스트 저작을 마친 뒤 pack_authoring_complete(pack=...)를 호출하세요. 통과 전에는 ZIP을 저장하지 않습니다.",
+        }
     authoring_quality = _authoring_quality(buf)
     if authoring_quality["status"] != "pass":
         return {"status": "needs_authoring", "quality": authoring_quality,
-                "next": "원문을 구조화해 Claim 또는 Concept/Kinetic을 추가한 뒤 다시 pack_save를 호출하세요. Evidence-only 팩은 저장하지 않습니다."}
+                "next": "원문을 구조화해 Claim 또는 Kinetic을 근거와 연결한 뒤 다시 pack_save를 호출하세요. Evidence-only 팩은 저장하지 않습니다."}
     today = datetime.date.today().isoformat()
 
     # 1) 버퍼 -> 정본 5파일 (evidence 노드는 evidence.jsonl로도 승격)
