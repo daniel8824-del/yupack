@@ -21,9 +21,9 @@ import zipfile
 
 EMBED_URL = os.environ.get("YUPACK_EMBED_URL", "http://127.0.0.1:8000/v1/embeddings")
 
-# 정본의 기본 계약은 text-embedding-3-large(3072d)다.
-# 키가 없는 환경에서만 QMD/EmbeddingGemma(768d)를 무료 대체 경로로 쓴다.
-# bge-m3는 YUPACK_EMBED_MODEL=bge-m3 명시 때만 (OMLX 가동 필요).
+# 기본 임베딩 계약은 로컬 OMLX bge-m3(1024d)다. API 키는 필요 없다.
+# QMD는 볼트 검색 도구이며, Yupack에서는 명시적 호환 모드(YUPACK_EMBED_MODEL=qmd)
+# 로만 쓴다. 키가 없다는 이유로 QMD로 자동 전환하면 팩의 저장 벡터 계약이 바뀌므로 금지한다.
 def _qmd_available() -> bool:
     import shutil
     return shutil.which("qmd") is not None
@@ -37,10 +37,7 @@ def _pick_model() -> tuple[str, int]:
         return "qmd", 768
     if forced:
         return forced, {"text-embedding-3-large": 3072, "text-embedding-3-small": 1536}.get(forced, 1536)
-    # 무키 + qmd 설치 = 로컬 무료 벡터 (EmbeddingGemma 768d, 실측 30/30)
-    if not os.environ.get("OPENAI_API_KEY") and _qmd_available():
-        return "qmd", 768
-    return "text-embedding-3-large", 3072
+    return "bge-m3", 1024
 
 
 EMBED_MODEL, EMBED_DIM = _pick_model()
@@ -338,7 +335,8 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
                 json.dumps(m) for m in emb_meta).encode()
             emb_status = f"included({len(emb_meta)} x {EMBED_DIM}, {EMBED_MODEL}, normalized)"
         else:
-            emb_status = "unavailable(OPENAI_API_KEY 없음): lexical+graph로 동작"
+            emb_status = ("unavailable(로컬 OMLX bge-m3에 연결할 수 없음): "
+                          "lexical+graph로 동작")
 
     # query-docs/: 레버·결정경로·정책 근거 카드 (조건·한계·검수 상태 원문 그대로)
     review_by_target = {}
@@ -430,8 +428,9 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
         "storage": "vector-index/vectors.bin (float32 row-major)",
         "per_row_text_sha256": "vector-index/vector-metadata.jsonl",
         "corpus_sha256": _sha256(b"".join(m["text_sha256"].encode() for m in emb_meta)) if emb_meta else None,
-        "query_runtime": ("정본 벡터 모델과 같은 런타임을 우선 사용. 키가 없으면 qmd "
-                          "EmbeddingGemma 로컬 검색, 그것도 없으면 lexical+graph 폴백"),
+        "query_runtime": ("정본 벡터 모델과 같은 로컬 OMLX bge-m3 런타임을 사용한다. "
+                          "OMLX를 사용할 수 없으면 lexical+graph로 폴백하며, QMD는 "
+                          "명시적 호환 모드에서만 사용한다."),
     }, ensure_ascii=False, indent=1).encode()
     files["query-contract.json"] = json.dumps({
         "discovery_layer": "search_only",
@@ -528,7 +527,8 @@ class LocalPack:
         self.reviews: dict[str, list] = {}
         for r in _jsonl(self._read("reviews.jsonl")):
             self.reviews.setdefault(r["target_id"], []).append(
-                {"status": r.get("review_status"), "reviewer_role": r.get("reviewer_role"), "backend": "qmd" if qmd_backend else "openai"})
+                {"status": r.get("review_status"), "reviewer_role": r.get("reviewer_role"),
+                 "backend": EMBED_MODEL})
         self.adj: dict[str, list] = {}
         adj_p = os.path.join(root, "graph-index", "adjacency.jsonl")
         if not os.path.exists(adj_p):
@@ -638,8 +638,9 @@ class LocalPack:
         return self._qmd_col
 
     def vector(self, q: str, k: int = 8) -> list[dict]:
-        # 무키 로컬 경로: 런타임이 qmd거나 저장 벡터가 없으면 qmd 컬렉션으로 (있을 때만)
-        if EMBED_MODEL == "qmd" or not self.vec_meta:
+        # QMD는 명시적으로 선택한 호환 모드에서만 쓴다. 저장 벡터가 없다는 이유로
+        # QMD로 바꾸면 bge-m3 팩이 경량화된 다른 임베딩 계약으로 조용히 바뀐다.
+        if EMBED_MODEL == "qmd":
             col = self._qmd_col_lazy()
             if col:
                 hits = _qmd_vector_search(col, q, k)
@@ -649,7 +650,10 @@ class LocalPack:
                 return hits
         if not self.vec_meta:
             return []
-        # 질의 임베딩은 팩을 구운 모델과 동일해야 한다 (embeddings.json 기록 기준)
+        # 질의 임베딩은 팩을 구운 모델과 동일해야 한다 (embeddings.json 기록 기준).
+        # 기존 OpenAI/QMD 팩은 bge-m3와 차원이 달라 섞어 비교하지 않는다.
+        if self.embed_model != EMBED_MODEL or self.dim != EMBED_DIM:
+            return []
         qv = _embed([q], model=self.embed_model)
         if qv is None:
             return []
@@ -1105,7 +1109,7 @@ class LocalPack:
                                      "runtime_dimension": EMBED_DIM,
                                      "pack_model": self.embed_model,
                                      "pack_dimension": self.dim,
-                                     "backend": "qmd" if EMBED_MODEL == "qmd" else "pack_vectors",
+                                     "backend": "qmd" if EMBED_MODEL == "qmd" else "omlx-bge-m3",
                                  }},
             "local_pack_id": self.pack_id,
             "manifest_hash": self.manifest_hash,
