@@ -45,6 +45,31 @@ def test_no_key_authoring_saves_final_zip_and_reopens_queryable():
         assert answer["direct_evidence"][0]["evidence_id"] == "ev:memory"
 
 
+def test_default_pack_is_user_local_preference_not_codex_config():
+    _reset()
+    old_settings = os.environ.get("YUPACK_SETTINGS")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["YUPACK_SETTINGS"] = str(Path(td) / "settings.json")
+            S.pack_create("기본팩", save_to=td)
+            S.ontology_add_node("evidence", "TextUnit", "ev:default",
+                                {"label": "기본 근거", "text": "기본 팩의 근거다."}, pack="기본팩")
+            saved = S.pack_save("기본팩", include_embeddings=False)
+            chosen = S.pack_set_default(saved["saved_to"])
+            assert chosen["ok"]
+            assert Path(chosen["settings"]).is_file()
+            S._AUTO_OPENED = {}
+            S._auto_open_on_start()
+            assert S._AUTO_OPENED["path"] == saved["saved_to"]
+            assert S._AUTO_OPENED["pack_handle"].startswith("pack_")
+    finally:
+        S._AUTO_OPENED = {}
+        if old_settings is None:
+            os.environ.pop("YUPACK_SETTINGS", None)
+        else:
+            os.environ["YUPACK_SETTINGS"] = old_settings
+
+
 def test_no_key_zip_ingest_returns_host_extraction_workflow():
     _reset()
     with tempfile.TemporaryDirectory() as td:

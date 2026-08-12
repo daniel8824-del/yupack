@@ -1028,6 +1028,33 @@ _AUTO_OPENED: dict = {}
 _NON_FINAL_PACK_MARKERS = ("archive", "improved", "request", "draft", "test", "retrofit")
 
 
+def _settings_path() -> Path:
+    """사용자가 고른 기본 팩만 로컬 설정에 보관한다.
+
+    플러그인/공용 config.toml을 수정하지 않는다. 환경변수는 테스트 또는 이식 환경에서
+    별도 설정 파일을 지정할 때만 쓴다.
+    """
+    raw = os.environ.get("YUPACK_SETTINGS")
+    return Path(os.path.expanduser(raw)) if raw else Path.home() / ".yupack" / "settings.json"
+
+
+def _default_pack_path() -> str | None:
+    try:
+        path = json.loads(_settings_path().read_text(encoding="utf-8")).get("default_pack")
+        if isinstance(path, str) and os.path.isfile(os.path.expanduser(path)):
+            return os.path.expanduser(path)
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    return None
+
+
+def _save_default_pack_path(zip_path: str) -> None:
+    settings = _settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"default_pack": zip_path}, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+
+
 def _is_final_pack_path(path: str) -> bool:
     """정본 후보 이름만 통과시킨다. 수정시각은 정본성의 증거가 아니다."""
     name = Path(path).stem.lower()
@@ -1098,9 +1125,9 @@ def _open_verified_final_library() -> dict:
 
 
 def _auto_open_on_start():
-    """YUPACK_AUTO_OPEN=<zip|library|latest>로 팩을 자동으로 연다."""
+    """명시 환경변수 또는 사용자가 고른 로컬 기본 팩을 자동으로 연다."""
     global _AUTO_OPENED
-    target = os.environ.get("YUPACK_AUTO_OPEN")
+    target = os.environ.get("YUPACK_AUTO_OPEN") or _default_pack_path()
     if not target or _AUTO_OPENED:
         return
     try:
@@ -1254,58 +1281,22 @@ def pack_close(pack_handle: str) -> dict:
 
 @mcp.tool()
 def pack_set_default(zip_path: str) -> dict:
-    """이 컴퓨터의 기본 팩을 지정한다 (Codex 등록의 YUPACK_AUTO_OPEN을 갱신).
+    """이 컴퓨터의 기본 팩을 지정한다.
 
-    이후 새 Codex 작업마다 이 팩이 자동으로 열려, 사용자는 pack_open_local 없이 바로 질문할 수 있다.
-    zip_path는 사용자가 자기 팩을 저장한 경로다. 모르면 사용자에게 물어라 (사람마다 다르다).
+    사용자가 명시적으로 고른 zip 경로를 ~/.yupack/settings.json에만 저장한다. 플러그인 정의나
+    Codex 공용 config.toml은 수정하지 않는다. 이후 새 작업에서 이 팩만 자동으로 열 수 있다.
+    zip_path를 모르면 사용자에게 물어라 (사람마다 다르다).
     """
     _ro = _read_only_block()
     if _ro:
         return _ro
-    import tomllib
     zip_path = os.path.expanduser(zip_path)
     if not os.path.exists(zip_path):
         return {"error": f"팩 파일이 없습니다: {zip_path}. 저장한 팩 zip 경로를 확인하세요."}
-    cfg = os.path.expanduser("~/.codex/config.toml")
-    if not os.path.exists(cfg):
-        return {"error": "~/.codex/config.toml이 없습니다. Codex CLI 설치 후 yupack MCP를 먼저 등록하세요."}
-    text = open(cfg, encoding="utf-8").read()
-    try:
-        data = tomllib.loads(text)
-    except Exception as e:
-        return {"error": f"config.toml 파싱 실패: {e}"}
-    srv = (data.get("mcp_servers") or {})
-    name = "yupack-local" if "yupack-local" in srv else ("yupack" if "yupack" in srv else None)
-    if not name:
-        return {"error": "config.toml에 yupack MCP 등록이 없습니다. 먼저 codex mcp add로 등록하세요."}
-    # [mcp_servers.<name>.env] 섹션의 YUPACK_AUTO_OPEN 라인을 갱신/추가 (다른 섹션 무손상)
-    lines = text.splitlines()
-    env_hdr = f"[mcp_servers.{name}.env]"
-    out, in_env, done = [], False, False
-    for ln in lines:
-        st = ln.strip()
-        if st.startswith("[") and st != env_hdr and in_env:
-            if not done:
-                out.append(f'YUPACK_AUTO_OPEN = "{zip_path}"')
-                out.append("")
-                done = True
-            in_env = False
-        if st == env_hdr:
-            in_env = True
-        if in_env and st.startswith("YUPACK_AUTO_OPEN"):
-            out.append(f'YUPACK_AUTO_OPEN = "{zip_path}"')
-            done = True
-            continue
-        out.append(ln)
-    if in_env and not done:
-        out.append(f'YUPACK_AUTO_OPEN = "{zip_path}"')
-        done = True
-    if not done:  # env 섹션 자체가 없으면 추가
-        out += ["", env_hdr, f'YUPACK_AUTO_OPEN = "{zip_path}"']
-    with open(cfg, "w", encoding="utf-8") as f:
-        f.write("\n".join(out) + "\n")
-    return {"ok": True, "default_pack": zip_path, "server": name,
-            "note": "기본 팩 지정 완료. Codex를 재시작하면 이 팩이 자동으로 열려 바로 질문할 수 있습니다."}
+    _save_default_pack_path(zip_path)
+    return {"ok": True, "default_pack": zip_path,
+            "settings": str(_settings_path()),
+            "note": "기본 팩 지정 완료. 다음 새 대화에서 이 팩을 자동으로 열 수 있습니다."}
 
 
 @mcp.tool()
