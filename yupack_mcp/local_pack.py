@@ -757,7 +757,7 @@ class LocalPack:
         (3) 인과 관계는 방향을 보존해 trace에 남기고 (4) Evidence에서 records/supports로
         Action·Claim을 답변 후보로 투영한다. 허브 노드(per:* 87엣지 등)에서 인과 체인이
         잘려나가던 문제의 해소가 목적이다."""
-        visited, trace, frontier = set(seeds), [], list(seeds)
+        visited, trace, frontier, traced = set(seeds), [], list(seeds), set()
         for hop in range(hops):
             nxt = []
             for nid in frontier:
@@ -775,18 +775,24 @@ class LocalPack:
                     if not (is_causal or base in PROJECT_RELS
                             or base in ("performs", "involves")):
                         continue
+                    # 두 끝점이 모두 lexical/vector seed여도 인과 화살표는 결과에 남아야 한다.
+                    # 이전에는 visited 검사에 먼저 걸려 triggers가 사라지고, "왜" 답변에서
+                    # 가장 중요한 kinetic trace가 빈 배열이 됐다.
+                    edge_key = (nid, base, rel.startswith("~"), other)
+                    if edge_key not in traced:
+                        traced.add(edge_key)
+                        trace.append({
+                            "hop": hop + 1, "from": nid, "rel": base,
+                            "direction": "reverse" if rel.startswith("~") else "forward",
+                            "to": other,
+                            "axis": "causal" if is_causal else "projection",
+                            "from_label": (self.nodes.get(nid) or {}).get("label"),
+                            "to_label": (self.nodes.get(other) or {}).get("label"),
+                        })
                     if other in visited or len(visited) >= cap:
                         continue
                     visited.add(other)
                     nxt.append(other)
-                    trace.append({
-                        "hop": hop + 1, "from": nid, "rel": base,
-                        "direction": "reverse" if rel.startswith("~") else "forward",
-                        "to": other,
-                        "axis": "causal" if is_causal else "projection",
-                        "from_label": (self.nodes.get(nid) or {}).get("label"),
-                        "to_label": (self.nodes.get(other) or {}).get("label"),
-                    })
             frontier = nxt
             if not frontier:
                 break
@@ -1130,10 +1136,20 @@ class LocalPack:
         if not src:
             src = {e.get("source_path") for e in evs if e.get("source_path")}
         sources = sorted(s for s in src if s)[:top_k]
-        causal_chains = [{"from": t["from"], "from_label": t.get("from_label"),
-                           "rel": t["rel"], "direction": t["direction"],
-                           "to": t["to"], "to_label": t.get("to_label")}
-                          for t in ctrace if t["axis"] == "causal"]
+        # 양 끝점이 seed면 같은 화살표가 정방향·역방향으로 모두 탐색될 수 있다.
+        # 결과에는 하나만, 가능하면 원래 정방향을 보인다.
+        causal_by_edge: dict[tuple[str, str, str], dict] = {}
+        for t in ctrace:
+            if t["axis"] != "causal":
+                continue
+            key = tuple(sorted((t["from"], t["to"]))) + (t["rel"],)
+            item = {"from": t["from"], "from_label": t.get("from_label"),
+                    "rel": t["rel"], "direction": t["direction"],
+                    "to": t["to"], "to_label": t.get("to_label")}
+            old = causal_by_edge.get(key)
+            if old is None or (old["direction"] == "reverse" and item["direction"] == "forward"):
+                causal_by_edge[key] = item
+        causal_chains = list(causal_by_edge.values())
         causal_assessment = None
         if causal and not causal_chains:
             causal_assessment = {
