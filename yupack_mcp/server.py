@@ -1240,11 +1240,15 @@ def _open_verified_final_library() -> dict:
         _AUTO_OPENED = {"error": "무결성 검증을 통과한 final 팩이 없습니다.", "directory": candidates[0]}
         return _AUTO_OPENED
     if len(paths) > 1:
+        choices = [{"title": os.path.basename(os.path.dirname(path)) or os.path.basename(path),
+                    "path": path} for path in paths]
         _AUTO_OPENED = {
             "status": "pack_selection_needed",
             "directory": candidates[0],
             "verified_final_packs": paths,
-            "hint": "질문 속 작품명에 맞는 path를 pack_open_local로 열고 다시 질문하세요.",
+            "choices": choices,
+            "ask_user": "정본 팩이 여러 개입니다. 어느 작품 팩을 열까요? 한 번 고르면 이 컴퓨터의 기본 팩으로 등록할 수 있습니다.",
+            "hint": "선택한 path를 pack_open_local로 열고 다시 질문하세요. 추측으로 다른 작품 팩을 열지 않습니다.",
         }
         return _AUTO_OPENED
     from . import local_pack
