@@ -20,6 +20,8 @@ import urllib.request
 import zipfile
 
 EMBED_URL = os.environ.get("YUPACK_EMBED_URL", "http://127.0.0.1:8000/v1/embeddings")
+BGE_CACHE_DIR = os.path.expanduser(
+    os.environ.get("YUPACK_BGE_CACHE_DIR", "~/.cache/yupack/bge-m3"))
 
 # 기본 임베딩 계약은 로컬 OMLX bge-m3(1024d)다. API 키는 필요 없다.
 # QMD는 볼트 검색 도구이며, Yupack에서는 명시적 호환 모드(YUPACK_EMBED_MODEL=qmd)
@@ -126,6 +128,19 @@ def _qmd_doc_text(n: dict) -> str:
     return " ".join(str(x) for x in [n.get("label") or p.get("label"), p.get("label_ko"), *alias,
                                       p.get("text"), p.get("definition"), p.get("statement"),
                                       p.get("mechanism")] if x)[:1500]
+
+
+def _node_embedding_text(n: dict) -> str:
+    """팩·로컬 sidecar가 같은 bge-m3 입력을 쓰도록 한 곳에 고정한다."""
+    p = n.get("properties", {})
+    aliases = p.get("aliases_ko") or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    return " ".join(str(x) for x in [
+        n.get("label"), p.get("label"), p.get("label_ko"), *aliases,
+        p.get("text"), p.get("summary"), p.get("definition"), p.get("statement"),
+        p.get("mechanism"), p.get("description"),
+    ] if x)[:1500]
 
 
 def _qmd_ensure_collection(pack_id: str, nodes: dict) -> str | None:
@@ -308,13 +323,7 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
         for n in nodes:
             if n.get("space") == "resource":
                 continue
-            p = n.get("properties", {})
-            alias = p.get("aliases_ko") or []
-            if isinstance(alias, str):
-                alias = [alias]
-            text = " ".join(str(x) for x in [n.get("label"), p.get("label_ko"), *alias,
-                                              p.get("definition"),
-                                              p.get("statement"), p.get("mechanism")] if x)[:1500]
+            text = _node_embedding_text(n)
             if text.strip():
                 targets.append((n["id"], text))
         vec_buf = io.BytesIO()
@@ -637,6 +646,69 @@ class LocalPack:
             self._qmd_slug2id = {re.sub(r"[^a-z0-9]+", "-", nid.lower()): nid for nid in self.nodes}
         return self._qmd_col
 
+    def _bge_sidecar(self) -> tuple[list[dict], bytes] | None:
+        """구형 3072d 팩에도 사용자 로컬 bge-m3 캐시를 붙인다.
+
+        정본 zip은 절대 수정하지 않는다. 캐시는 manifest hash에 묶이므로 팩이 바뀌면
+        자동으로 새로 만든다. 이 경로가 없으면 기존 팩은 lexical+graph로만 답한다.
+        """
+        if EMBED_MODEL != "bge-m3":
+            return None
+        if getattr(self, "_bge_sidecar_loaded", False):
+            return self._bge_sidecar_data
+        self._bge_sidecar_loaded = True
+        self._bge_sidecar_data = None
+        key = self.manifest_hash or _sha256(self.pack_id.encode())
+        os.makedirs(BGE_CACHE_DIR, exist_ok=True)
+        meta_path = os.path.join(BGE_CACHE_DIR, f"{key}.json")
+        vec_path = os.path.join(BGE_CACHE_DIR, f"{key}.bin")
+        try:
+            cached = json.load(open(meta_path, encoding="utf-8"))
+            if (cached.get("model") == "bge-m3" and cached.get("dimension") == EMBED_DIM
+                    and cached.get("manifest_hash") == self.manifest_hash):
+                raw = open(vec_path, "rb").read()
+                if len(raw) == len(cached["rows"]) * EMBED_DIM * 4:
+                    self._bge_sidecar_data = (cached["rows"], raw)
+                    return self._bge_sidecar_data
+        except Exception:
+            pass
+
+        targets = [(nid, _node_embedding_text(n)) for nid, n in self.nodes.items()
+                   if n.get("space") != "resource" and _node_embedding_text(n).strip()]
+        rows, buf = [], io.BytesIO()
+        for i in range(0, len(targets), 64):
+            batch = targets[i:i + 64]
+            vectors = _embed([text for _, text in batch], model="bge-m3")
+            if vectors is None or len(vectors) != len(batch) or any(len(v) != EMBED_DIM for v in vectors):
+                return None
+            for (nid, text), vector in zip(batch, vectors):
+                rows.append({"id": nid, "row": len(rows), "text_sha256": _sha256(text.encode())})
+                buf.write(struct.pack(f"{EMBED_DIM}f", *vector))
+        raw = buf.getvalue()
+        payload = {"schema": 1, "model": "bge-m3", "dimension": EMBED_DIM,
+                   "manifest_hash": self.manifest_hash, "rows": rows}
+        try:
+            tmp_meta = meta_path + ".tmp"
+            tmp_vec = vec_path + ".tmp"
+            with open(tmp_meta, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            with open(tmp_vec, "wb") as f:
+                f.write(raw)
+            os.replace(tmp_meta, meta_path)
+            os.replace(tmp_vec, vec_path)
+        except Exception:
+            return None
+        self._bge_sidecar_data = (rows, raw)
+        return self._bge_sidecar_data
+
+    def _vector_space(self) -> tuple[list[dict], bytes, int, str] | None:
+        if self.vec_meta and self.embed_model == EMBED_MODEL and self.dim == EMBED_DIM:
+            return self.vec_meta, self.vecs, self.dim, "pack_vectors"
+        sidecar = self._bge_sidecar()
+        if sidecar:
+            return sidecar[0], sidecar[1], EMBED_DIM, "omlx-bge-m3-sidecar"
+        return None
+
     def vector(self, q: str, k: int = 8) -> list[dict]:
         # QMD는 명시적으로 선택한 호환 모드에서만 쓴다. 저장 벡터가 없다는 이유로
         # QMD로 바꾸면 bge-m3 팩이 경량화된 다른 임베딩 계약으로 조용히 바뀐다.
@@ -648,20 +720,19 @@ class LocalPack:
                 for h in hits:
                     h["id"] = s2i.get(re.sub(r"[^a-z0-9]+", "-", h["id"].lower()), h["id"])
                 return hits
-        if not self.vec_meta:
+        space = self._vector_space()
+        if not space:
             return []
-        # 질의 임베딩은 팩을 구운 모델과 동일해야 한다 (embeddings.json 기록 기준).
-        # 기존 OpenAI/QMD 팩은 bge-m3와 차원이 달라 섞어 비교하지 않는다.
-        if self.embed_model != EMBED_MODEL or self.dim != EMBED_DIM:
-            return []
-        qv = _embed([q], model=self.embed_model)
+        meta, vectors, dim, backend = space
+        qv = _embed([q], model=EMBED_MODEL)
         if qv is None:
             return []
         qv = qv[0]
-        row = self.dim * 4
+        self._active_vector_backend = backend
+        row = dim * 4
         best = []
-        for m in self.vec_meta:
-            v = struct.unpack_from(f"{self.dim}f", self.vecs, m["row"] * row)
+        for m in meta:
+            v = struct.unpack_from(f"{dim}f", vectors, m["row"] * row)
             best.append((sum(a * b for a, b in zip(qv, v)), m["id"]))
         best.sort(reverse=True)
         return [{"id": nid, "cosine": round(s, 4)} for s, nid in best[:k]]
@@ -798,6 +869,8 @@ class LocalPack:
         # qmd(젬마 rerank %)는 유관 0.88+ 실측 - strong 컷 0.55
         if EMBED_MODEL == "qmd" or (not self.vec_meta and getattr(self, "_qmd_col", None)):
             return 0.55
+        if EMBED_MODEL == "bge-m3":
+            return 0.76
         return 0.35 if str(self.embed_model).startswith("text-embedding") else 0.76
 
     def _translate_query_en(self, q: str) -> str | None:
@@ -1014,9 +1087,11 @@ class LocalPack:
         lever_ids_all = [nid for nid, n in self.nodes.items() if n.get("space") == "lever"]
         if lever_ids_all:
             q_toks_l = {t for t in re.findall(r"[\w가-힣]+", question) if len(t) >= 2}
-            qv = _embed([question], model=self.embed_model)
+            space = self._vector_space()
+            qv = _embed([question], model=EMBED_MODEL) if space else None
             qv = qv[0] if qv else None
-            row_of = {m["id"]: m["row"] for m in self.vec_meta}
+            meta, raw, dim, _ = space if space else ([], b"", EMBED_DIM, "none")
+            row_of = {m["id"]: m["row"] for m in meta}
             scored_lv = []
             for nid in lever_ids_all:
                 n = self.nodes[nid]
@@ -1029,7 +1104,7 @@ class LocalPack:
                     qt == t or qt.startswith(t) or t.startswith(qt) for qt in q_toks_l))
                 sc = inter * 3.0
                 if qv is not None and nid in row_of:
-                    v = struct.unpack_from(f"{self.dim}f", self.vecs, row_of[nid] * self.dim * 4)
+                    v = struct.unpack_from(f"{dim}f", raw, row_of[nid] * dim * 4)
                     sc += sum(a * b for a, b in zip(qv, v)) * 5.0
                 scored_lv.append((sc, nid))
             scored_lv.sort(reverse=True)
@@ -1109,7 +1184,8 @@ class LocalPack:
                                      "runtime_dimension": EMBED_DIM,
                                      "pack_model": self.embed_model,
                                      "pack_dimension": self.dim,
-                                     "backend": "qmd" if EMBED_MODEL == "qmd" else "omlx-bge-m3",
+                                     "backend": getattr(self, "_active_vector_backend",
+                                                        "qmd" if EMBED_MODEL == "qmd" else "omlx-bge-m3"),
                                  }},
             "local_pack_id": self.pack_id,
             "manifest_hash": self.manifest_hash,
