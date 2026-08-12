@@ -1530,14 +1530,15 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
                  f"storage: \"local zip only, production DB 미접촉\"\n")
 
     with _tf.TemporaryDirectory() as td:
-        src = os.path.join(td, "canonical.zip")
+        safe_pack = _safe_filename(pack)
+        src = os.path.join(td, f"{safe_pack}-canonical.zip")
         with zipfile.ZipFile(src, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("pack.yaml", pack_yaml)
             z.writestr("nodes.jsonl", "\n".join(nodes_l))
             z.writestr("edges.jsonl", "\n".join(edges_l))
             z.writestr("evidence.jsonl", "\n".join(evidence_l))
             z.writestr("reviews.jsonl", "")
-        out = os.path.join(td, "pack-queryable.zip")
+        out = os.path.join(td, f"{safe_pack}-pack-final-{today}.zip")
         # 2) 같은 표준 파이프라인으로 질의 가능 zip 생성
         r = local_pack.build_queryable(src, out, include_embeddings)
         if "error" in r:

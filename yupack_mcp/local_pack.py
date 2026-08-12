@@ -113,7 +113,12 @@ QMD_DIR = os.path.expanduser(os.environ.get("YUPACK_QMD_DIR", "~/.cache/yupack/q
 
 
 def _qmd_collection_name(pack_id: str) -> str:
-    return "yupack-" + re.sub(r"[^a-zA-Z0-9_-]", "-", pack_id)[:48]
+    # QMD 컬렉션명은 ASCII만 안정적으로 다룬다. 한글 제목을 '-'로만 바꾸면
+    # 같은 날 만든 여러 팩이 전부 같은 이름이 되어 벡터 결과가 섞일 수 있다.
+    # 읽을 수 있는 ASCII 부분 + 원본 pack_id 해시를 함께 써서 충돌을 막는다.
+    slug = re.sub(r"[^a-zA-Z0-9_-]", "-", pack_id).strip("-_") or "pack"
+    digest = _sha256(pack_id.encode())[:12]
+    return f"yupack-{slug[:36]}-{digest}"
 
 
 def _qmd_doc_text(n: dict) -> str:

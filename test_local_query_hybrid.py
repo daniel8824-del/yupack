@@ -5,6 +5,12 @@ import zipfile
 from pathlib import Path
 
 from yupack_mcp.local_pack import LocalPack
+from yupack_mcp.local_pack import _qmd_collection_name
+
+
+def test_qmd_collection_name_keeps_korean_pack_ids_distinct():
+    assert _qmd_collection_name("동물농장-pack-final-2026-08-12.zip") != \
+        _qmd_collection_name("삼국지-pack-final-2026-08-12.zip")
 
 
 def _pack_without_graph() -> tuple[tempfile.TemporaryDirectory, LocalPack]:
