@@ -1,4 +1,6 @@
-mcp>=1.9.0
+# 상한 고정 필수: mcp 2.x는 mcp.server.fastmcp 경로를 없애 import가 죽는다.
+# pyproject.toml과 반드시 같은 범위를 유지할 것 (NIXPACKS 빌드는 이 파일을 쓴다).
+mcp>=1.9.0,<2.0
 neo4j>=5.20
 openai>=1.40
 uvicorn>=0.30
