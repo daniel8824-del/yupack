@@ -53,9 +53,9 @@ _INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 �
 - 환경변수 YUPACK_AUTO_OPEN에 zip 경로 또는 "library"가 있으면 서버가 시작할 때 엽니다.
   library에 정본이 여러 개면 작품을 추측해 열지 않고 선택 후보를 돌려줍니다.
 - 팩 서랍의 PACK-CHARTER.md(팩 생산 헌장)는 저장 시 자동 동봉됩니다. 저작 전에 한 번 읽으세요.
-- 임베딩: OPENAI_API_KEY가 있으면 정본과 같은 OpenAI 벡터를 쓰고, 키가 없으면 qmd가
-  설치된 경우 자동으로 로컬 임베딩(EmbeddingGemma, 무료·무키)을 씁니다. 둘 다 없으면
-  어휘+그래프로 동작합니다.
+- 임베딩: Yupack의 기본은 로컬 OMLX bge-m3(1024차원)이며 API 키가 필요 없습니다.
+  OMLX가 꺼져 있으면 어휘+그래프로만 동작한다고 명시합니다. QMD는 볼트 검색 도구이며
+  `YUPACK_EMBED_MODEL=qmd`를 사용자가 명시한 호환 모드에서만 씁니다.
 - 무키 저작: 원문에서 노드·관계를 자동 추출하는 외부 API 호출은 하지 않습니다. 이때는
   팩 생성 보조 도구가 원문 묶음을 근거 노드로 넣고 `needs_host_extraction`을 돌려줍니다.
   호출한 대화 모델이 반환된 원문을 읽어 ontology_add_node/ontology_add_edge로 구조화합니다.
@@ -1563,8 +1563,8 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
         (isinstance(emb, str) and emb.startswith(("qmd(", "included(")))
     if not embedding_ready:
         result["embedding_warning"] = ("임베딩 0개로 저장됐습니다. 한국어 등 의미(벡터) 질의가 "
-                                        "약해집니다. include_embeddings=true와 OPENAI_API_KEY "
-                                        "설정을 확인한 뒤 다시 저장하는 것을 권장합니다.")
+                                        "약해집니다. include_embeddings=true와 로컬 OMLX bge-m3 "
+                                        "실행 상태를 확인한 뒤 다시 저장하는 것을 권장합니다.")
     if qa["status"] != "pass":
         result["qa_warning"] = ("팩에 그래머 위반이 있습니다. quality/report.json 참조. "
                                 "pack_qa로 확인 후 수정하고 다시 저장하는 것을 권장합니다.")
