@@ -922,9 +922,15 @@ class LocalPack:
         prio += [t["to"] for t in ctrace
                  if t["axis"] == "projection" and t["from"] in chain_nodes
                  and (self.nodes.get(t["to"], {}) or {}).get("space") in ("claim", "evidence")]
+        # 인과 체인이 적은 팩에서는 어떤 "왜" 질문이든 같은 체인으로 걸어 들어가
+        # 늘 같은 Claim이 1순위가 된다. 질문과의 어휘·벡터 근접도로 다시 세워
+        # 체인 위에 있다는 이유만으로 무관한 Claim이 앞서지 않게 한다.
+        prio.sort(key=lambda nid: -score.get(nid, 0.0))
         # 인과 질문에서는 인과 경로와 그 위의 Claim·Evidence가 시드보다 앞선다.
         # 어휘가 끌어온 주제 Claim이 top_k를 선점해 질문에 직답하는 Claim이 밀리던 문제.
-        head = (prio + list(seeds)) if causal else (list(seeds) + prio)
+        # 질문이 직접 끌어온 후보(seeds)가 먼저, 인과 체인에서 투영된 것(prio)이 다음.
+        # prio를 앞세우면 체인이 3개뿐인 팩에서 어떤 "왜" 질문이든 같은 Claim이 1순위가 된다.
+        head = list(seeds) + prio
         discovery = head + [t["to"] for t in ctrace] + [t["to"] for t in gtrace]
         seen_o = set()
         ordered = [n for n in discovery if not (n in seen_o or seen_o.add(n))]
