@@ -461,13 +461,29 @@ class LocalPack:
             with zipfile.ZipFile(io.BytesIO(raw)) as z:
                 z.extractall(self.cache)
             open(os.path.join(self.cache, ".ok"), "w").write("ok")
-        root = self.cache
-        for dirpath, _, fs in os.walk(self.cache):
-            if "manifest.lock" in fs and dirpath.endswith("runtime"):
-                root = os.path.dirname(dirpath)
-                break
+        # ZIP은 평면형과 wrapper/graph/형을 모두 허용한다. nodes.jsonl이
+        # 있는 디렉터리 하나만 고르면 graph/의 형제 index/evidence를 놓친다.
+        # __MACOSX/._ 메타데이터는 후보에서 제외하고 계약 마커가 가장 많은
+        # 디렉터리를 팩 루트로 택한다.
+        candidates: set[str] = {self.cache}
+        for dirpath, dirs, fs in os.walk(self.cache):
+            dirs[:] = [d for d in dirs if d != "__MACOSX" and not d.startswith("._")]
             if "nodes.jsonl" in fs:
-                root = dirpath
+                candidates.add(dirpath)
+                candidates.add(os.path.dirname(dirpath))
+            if "manifest.lock" in fs and os.path.basename(dirpath) == "runtime":
+                candidates.add(os.path.dirname(dirpath))
+
+        def root_score(path: str) -> int:
+            markers = ("graph-index", "lexical-index", "vector-index", "evidence", "runtime", "neo4j")
+            files = ("integrity.json", "pack.yaml", "manifest.json", "reviews.jsonl", "embeddings.json")
+            score = sum(os.path.isdir(os.path.join(path, marker)) for marker in markers)
+            score += sum(os.path.isfile(os.path.join(path, marker)) for marker in files)
+            score += 2 * os.path.isfile(os.path.join(path, "nodes.jsonl"))
+            score += 2 * os.path.isfile(os.path.join(path, "graph", "nodes.jsonl"))
+            return score
+
+        root = max(candidates, key=lambda path: (root_score(path), -len(path)))
         self.root = root
         # 무결성 검증 (manifest.lock 있으면)
         self.integrity = "no_manifest"
@@ -508,7 +524,14 @@ class LocalPack:
         if os.path.exists(adj_p):
             for l in open(adj_p, encoding="utf-8"):
                 d = json.loads(l)
-                self.adj[d["id"]] = d["edges"]
+                # 구형 Yupack은 [relation, node] 쌍, v2 final pack은
+                # {relation, node_id, direction, edge_id} 객체를 쓴다.
+                # 탐색 엔진의 내부 계약은 전자로 통일한다.
+                self.adj[d["id"]] = [
+                    [edge["relation"] if edge.get("direction") != "in" else "~" + edge["relation"], edge["node_id"]]
+                    if isinstance(edge, dict) else edge
+                    for edge in d["edges"]
+                ]
         self.vec_meta, self.vecs = [], b""
         vdir = "vector-index" if os.path.exists(os.path.join(root, "vector-index")) else "indexes"
         vm = os.path.join(root, vdir, "vector-metadata.jsonl")
@@ -521,12 +544,17 @@ class LocalPack:
         if os.path.exists(ej):
             em = json.load(open(ej, encoding="utf-8"))
             if em.get("model"):
-                self.embed_model, self.dim = em["model"], em.get("dim") or EMBED_DIM
+                self.embed_model, self.dim = em["model"], em.get("dimension") or em.get("dim") or EMBED_DIM
         self._audit("open", f"mode={mode}")
 
     def _read(self, name: str) -> str:
-        p = os.path.join(self.root, name)
-        return open(p, encoding="utf-8").read() if os.path.exists(p) else ""
+        paths = [os.path.join(self.root, name), os.path.join(self.root, "graph", name)]
+        if name == "evidence.jsonl":
+            paths.append(os.path.join(self.root, "evidence", "index.jsonl"))
+        for path in paths:
+            if os.path.exists(path):
+                return open(path, encoding="utf-8").read()
+        return ""
 
     def _runtime_db(self):
         return sqlite3.connect(os.path.join(self.root, "runtime", "ontology.sqlite"))
