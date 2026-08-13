@@ -634,10 +634,13 @@ class LocalPack:
 
     # --- retrieval 3종 ---
     def lexical(self, q: str, k: int = 8) -> list[dict]:
+        # 축 영수증: 실패를 빈 배열로 숨기지 않고 사유를 남긴다 (관측 계약)
+        self._lexical_receipt = {"status": "ok", "hits": 0}
         p = os.path.join(self.root, "lexical-index", "fts.sqlite")
         if not os.path.exists(p):
             p = os.path.join(self.root, "indexes", "lexical.sqlite")
         if not os.path.exists(p):
+            self._lexical_receipt = {"status": "unavailable: lexical-index가 팩에 없음", "hits": 0}
             return []
         toks = [t for t in re.findall(r"[\w가-힣]+", q)
                 if len(t) >= 2 or re.fullmatch(r"[가-힣]", t)]
@@ -663,6 +666,7 @@ class LocalPack:
             cols = [r[1] for r in con.execute("PRAGMA table_info(docs)")]
         except sqlite3.OperationalError:
             con.close()
+            self._lexical_receipt = {"status": "error: FTS 스키마를 읽지 못함", "hits": 0}
             return []
         kind_col = next((c for c in ("kind", "node_type", "space") if c in cols), None)
         sel = f"id, {kind_col}, bm25(docs)" if kind_col else "id, '', bm25(docs)"
@@ -673,7 +677,10 @@ class LocalPack:
                 (" OR ".join(dict.fromkeys(terms)), k)).fetchall()
         except sqlite3.OperationalError:
             rows = []
+            self._lexical_receipt = {"status": "error: FTS 질의 실패", "hits": 0}
         con.close()
+        if rows:
+            self._lexical_receipt = {"status": "ok", "hits": len(rows)}
         return [{"id": r[0], "kind": r[1], "bm25": round(r[2], 3)} for r in rows]
 
     def _qmd_col_lazy(self) -> str | None:
@@ -756,13 +763,22 @@ class LocalPack:
                 s2i = getattr(self, "_qmd_slug2id", {})
                 for h in hits:
                     h["id"] = s2i.get(re.sub(r"[^a-z0-9]+", "-", h["id"].lower()), h["id"])
+                self._vector_receipt = {"status": "ok", "backend": "qmd", "hits": len(hits)}
                 return hits
+            self._vector_receipt = {"status": "unavailable: qmd 컬렉션 준비 실패",
+                                    "backend": "qmd", "hits": 0}
         space = self._vector_space()
         if not space:
+            self._vector_receipt = {
+                "status": (f"unavailable: 쓸 수 있는 벡터 없음 (팩 {self.embed_model or '없음'}"
+                           f"·{self.dim or 0}d, 런타임 {EMBED_MODEL}·{EMBED_DIM}d)"),
+                "backend": None, "hits": 0}
             return []
         meta, vectors, dim, backend = space
         qv = _embed([q], model=EMBED_MODEL)
         if qv is None:
+            self._vector_receipt = {"status": f"unavailable: 임베딩 백엔드({EMBED_MODEL}) 미응답",
+                                    "backend": backend, "hits": 0}
             return []
         qv = qv[0]
         self._active_vector_backend = backend
@@ -772,7 +788,22 @@ class LocalPack:
             v = struct.unpack_from(f"{dim}f", vectors, m["row"] * row)
             best.append((sum(a * b for a, b in zip(qv, v)), m["id"]))
         best.sort(reverse=True)
-        return [{"id": nid, "cosine": round(s, 4)} for s, nid in best[:k]]
+        out = [{"id": nid, "cosine": round(s, 4)} for s, nid in best[:k]]
+        self._vector_receipt = {"status": "ok", "backend": backend, "hits": len(out)}
+        return out
+
+    def _axis_receipts(self, gtrace=None, ctrace=None) -> dict:
+        """축별 관측 영수증. 실패 축은 빈 배열이 아니라 사유로 보고한다.
+
+        '조용히 죽는 고장'(예외를 삼켜 빈 결과가 성공처럼 보이는 것) 방지.
+        KINGCRAB truth contract("empty/failed receipt는 성공으로 취급하지 않는다") 이식.
+        """
+        return {
+            "lexical": getattr(self, "_lexical_receipt", {"status": "not_run", "hits": 0}),
+            "vector": getattr(self, "_vector_receipt", {"status": "not_run", "hits": 0}),
+            "graph": {"status": "ok", "path_nodes": len(gtrace or []),
+                      "causal_paths": len(ctrace or [])},
+        }
 
     def expand(self, seeds: list[str], hops: int = 3, cap: int = 40):
         visited, trace, frontier = set(seeds), [], list(seeds)
@@ -1019,6 +1050,7 @@ class LocalPack:
             self._audit("ask", f"no_local_evidence: {question[:80]}")
             return {"status": "no_local_evidence", "answer_guide": "팩에 근거가 없습니다. 답변은 \"팩에는 근거가 없다\"부터 밝힌 뒤에만 일반 지식으로 하세요.", "local_pack_id": self.pack_id,
                     "manifest_hash": self.manifest_hash,
+                    "axis_receipts": self._axis_receipts(),
                     "message": "이 팩에는 질문을 뒷받침할 로컬 근거가 없습니다. "
                                "일반 지식/클라우드로 대체하지 마세요."}
         # 인과 질문은 시드를 넓게 잡는다. 어휘가 8건 쏟아지면 벡터 상위가 시드에서 밀려
@@ -1226,6 +1258,7 @@ class LocalPack:
             "review_status": {c["id"]: c["review_status"] for c in cards
                                if c.get("id") and c.get("review_status")},
             "retrieval_trace": {"lexical_hits": lex[:8], "vector_hits": vec[:5],
+                                 "axis_receipts": self._axis_receipts(gtrace, ctrace),
                                  "graph_path": gtrace[:30],
                                  "causal_path": ctrace[:40],
                                  "question_intent": "causal" if causal else "factual",

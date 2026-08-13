@@ -160,6 +160,23 @@ def _begin_host_authoring(buf: dict, source_id: str) -> dict:
 _load_packs()
 
 
+def _compute_source_revision() -> str:
+    """소스 지문. import 시점에 한 번만 계산한다 — 낡은 프로세스가 디스크의 새 소스를
+    읽고 최신인 척하는 것을 막는다 (KINGCRAB protocol.py 리비전 지문 패턴 이식)."""
+    root = Path(__file__).resolve().parent
+    parts = []
+    for path in sorted(root.glob("*.py")):
+        try:
+            src = path.read_bytes()
+        except OSError:
+            continue
+        parts.append(path.name.encode() + b":" + hashlib.sha256(src).digest())
+    return hashlib.sha256(b"|".join(parts)).hexdigest()[:16]
+
+
+SOURCE_REVISION = _compute_source_revision()
+
+
 def _read_only_block() -> dict | None:
     """YUPACK_READ_ONLY=1 이면 저작·변경 도구를 잠근다 (전용 질의 플러그인 배포용)."""
     if os.environ.get("YUPACK_READ_ONLY") == "1":
@@ -1346,7 +1363,9 @@ def pack_status(pack_handle: str) -> dict:
     """열린 로컬 팩의 무결성·카운트·모드를 반환한다."""
     from . import local_pack
     pk = local_pack.get(pack_handle)
-    return pk.status() if pk else {"error": f"핸들 없음: {pack_handle}"}
+    if not pk:
+        return {"error": f"핸들 없음: {pack_handle}"}
+    return {**pk.status(), "source_revision": SOURCE_REVISION}
 
 
 @mcp.tool()
@@ -1437,6 +1456,7 @@ def pack_configure(pack_dir: str = "", embed_model: str = "", confirm: bool = Fa
     if not updates and not confirm:
         return {"settings": _load_settings(), "effective_model": local_pack.EMBED_MODEL,
                 "dimension": local_pack.EMBED_DIM, "embed_options": _embed_backend_options(),
+                "source_revision": SOURCE_REVISION,
                 "gate": _setup_gate() or {"status": "ok"}}
     updates["last_confirmed"] = datetime.date.today().isoformat()
     saved = _update_settings(**updates)
@@ -1444,7 +1464,8 @@ def pack_configure(pack_dir: str = "", embed_model: str = "", confirm: bool = Fa
     out = {"ok": True,
            "settings": {k: saved.get(k) for k in
                         ("pack_dir", "embed_model", "confirm_interval", "last_confirmed", "default_pack")},
-           "effective_model": model, "dimension": dim}
+           "effective_model": model, "dimension": dim,
+           "source_revision": SOURCE_REVISION}
     env_model = os.environ.get("YUPACK_EMBED_MODEL")
     if env_model and saved.get("embed_model") and env_model != saved.get("embed_model"):
         out["warning"] = (f"환경변수 YUPACK_EMBED_MODEL={env_model}이 설정을 덮고 있습니다. "

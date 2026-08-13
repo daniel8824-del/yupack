@@ -41,6 +41,8 @@ def test_configure_saves_and_passes_gate(own_settings):
     td, path = own_settings
     r = S.pack_configure(pack_dir=td, embed_model="none")
     assert r["ok"] and r["effective_model"] == "none"
+    # 소스 리비전 지문: 낡은 프로세스 탐지용 (import 시점 고정, 16 hex)
+    assert len(r["source_revision"]) == 16
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["pack_dir"] == td
     assert saved["last_confirmed"] == datetime.date.today().isoformat()

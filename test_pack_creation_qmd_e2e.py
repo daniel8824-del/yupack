@@ -81,6 +81,15 @@ def test_full_pack_creation_with_qmd_embeddings(monkeypatch):
             assert trace["vector_hits"], "qmd 벡터 히트가 비어 있다"
             assert "qmd" in json.dumps(trace), trace.get("backend")
             assert ans["claims"], "승격된 Claim이 답변에 없다"
+            # 축별 관측 영수증: 성공 축은 ok + 실제 히트 수
+            receipts = trace["axis_receipts"]
+            assert receipts["vector"]["status"] == "ok"
+            assert receipts["vector"]["backend"] == "qmd"
+            assert receipts["lexical"]["status"].startswith(("ok", "unavailable", "error"))
+            # 거절에도 영수증이 실려 "왜 축이 비었는지"가 보인다
+            off = lp.ask("비트코인 반감기는 언제인가?")
+            assert off["status"] == "no_local_evidence"
+            assert "axis_receipts" in off
     finally:
         S.PACKS.pop(pack, None)
         S.PACK_DESTINATIONS.pop(pack, None)
