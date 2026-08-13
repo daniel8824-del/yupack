@@ -49,6 +49,21 @@ class HostAuthoringTest(unittest.TestCase):
 
         self.assertEqual("needs_authoring_completion", result["status"])
 
+    def test_candidate_claim_cannot_reach_the_final_zip(self):
+        """유크라테스 계약: 후보는 승격 전에 완성 ZIP으로 나가지 못한다."""
+        ingested = self._ingest()
+        source_id = ingested["source_ids"][0]
+        server.authoring_register_candidate(
+            "claim", "Claim", "claim:candidate-only",
+            {"label": "검수 전 주장"}, source_id=source_id, pack="host-authored")
+
+        completion = server.pack_authoring_complete("host-authored")
+        saved = server.pack_save("host-authored", include_embeddings=False)
+
+        self.assertEqual("needs_promotion", completion["status"])
+        self.assertEqual("needs_promotion", saved["status"])
+        self.assertEqual(["claim:candidate-only"], saved["unpromoted_node_ids"])
+
     def test_claim_with_evidence_can_complete_without_kinetic(self):
         ingested = self._ingest()
         source_id = ingested["source_ids"][0]
