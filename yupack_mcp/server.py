@@ -848,20 +848,9 @@ def pack_import(source: str, pack: str = "정본팩") -> dict:
         return {"error": f"가져오기 실패: {e}"}
 
 
-@mcp.tool()
-def pack_build_queryable(source_zip: str, out_zip: str | None = None,
-                          include_embeddings: bool = True) -> dict:
-    """정본 zip을 self-contained 질의 가능 zip(indexes/ + runtime/ + reports/ 동봉)으로 재구성한다."""
-    _ro = _read_only_block()
-    if _ro:
-        return _ro
-    if not out_zip:
-        return {
-            "status": "needs_output_path",
-            "ask_user": "질의 가능 팩 zip을 어느 폴더에 저장할까요? 원하는 팩 서랍 경로를 알려주세요.",
-        }
-    from . import local_pack
-    return local_pack.build_queryable(source_zip, out_zip, include_embeddings)
+# pack_build_queryable MCP 도구는 제거됨 (오너 결정 2026-08-13): 입력을 만들던
+# 구 pack_save가 사라져 회색지대였다. 엔진 함수 local_pack.build_queryable은
+# T4 봉인 게이트 내장·테스트 픽스처용으로 내부 유지 — 필요 시 git 이력에서 복원.
 
 
 def _pack_contract(nodes: dict, edges: list[dict]) -> dict:
