@@ -1025,6 +1025,18 @@ class LocalPack:
                  "recomputed": f"{len(kin_ids) - len(uncovered_kin)}/{len(kin_ids)}",
                  "verdict": "PASS" if not uncovered_kin else "FAIL"},
             ]
+            # 키네틱 실효 게이트 (북팩 레인 확정 2026-08-13): %하한 대신 사슬 종수.
+            # 비율 목표는 인과 남용을 유발한다 — 서사류는 kinetic 간 사슬 엣지의
+            # "종류"가 4+면 건강 (참고 대역: 사슬 엣지/kinetic 15~40%).
+            if len(kin_ids) >= 5:
+                kin_set = set(kin_ids)
+                chain_kinds = {e.get("relation") for e in edges_p
+                               if (e.get("source") or e.get("from_id")) in kin_set
+                               and (e.get("target") or e.get("to_id")) in kin_set} \
+                    & {"precedes", "causes", "triggers", "results_in", "realizes"}
+                gate_items.append({"item": "kinetic_chain_kinds",
+                                   "recomputed": sorted(chain_kinds),
+                                   "verdict": "PASS" if len(chain_kinds) >= 4 else "FAIL"})
             floor_map = {"theme": counts["theme"], "claim": counts["claim"],
                          "grammar_kinds": counts["grammar_kinds"],
                          "evidence": per_rc.get("evidence"),

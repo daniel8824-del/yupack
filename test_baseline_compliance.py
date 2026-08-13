@@ -392,3 +392,45 @@ def test_gate9_works_on_notepack(tmp_path, monkeypatch):
     v = LocalPack(root).verify_baseline()
     assert v["present"] is True and v["anchor"]["mode"] == "declared"
     assert v["anchor"]["green"] is True and v["status"] == "PASS", v
+
+
+def test_kinetic_chain_kinds_gate(tmp_path, monkeypatch):
+    """키네틱 실효 게이트(북팩 확정): %하한이 아니라 사슬 엣지 종수 4+."""
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+
+    def _pack(path, kinds):
+        nodes = [{"id": "per:a", "space": "concept", "node_type": "Person",
+                  "properties": {"label": "A"}}]
+        edges, evidence = [], []
+        for i in range(6):
+            kid, eid = f"k:{i}", f"ev:{i}"
+            nodes.append({"id": kid, "space": "kinetic", "node_type": "Event",
+                          "properties": {"label": kid}})
+            nodes.append({"id": eid, "space": "evidence", "node_type": "TextUnit",
+                          "properties": {"label": eid}})
+            evidence.append({"evidence_id": eid, "summary": "s",
+                             "locator": {"start_line": i * 10 + 1, "end_line": i * 10 + 5}})
+            edges.append({"source": eid, "target": kid, "relation": "records", "properties": {}})
+        for i, rel in enumerate(kinds):
+            edges.append({"source": f"k:{i}", "target": f"k:{i+1}", "relation": rel,
+                          "properties": {}})
+        comp = {"profile": "t", "passed": True,
+                "measured": {"evidence": 6, "kinetic": 6, "theme": 0, "claim": 0,
+                              "grammar_kinds": len({e["relation"] for e in edges})}}
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("nodes.jsonl", "\n".join(json.dumps(n, ensure_ascii=False) for n in nodes))
+            z.writestr("edges.jsonl", "\n".join(json.dumps(e, ensure_ascii=False) for e in edges))
+            z.writestr("evidence.jsonl", "\n".join(json.dumps(e, ensure_ascii=False) for e in evidence))
+            z.writestr("reviews.jsonl", "")
+            z.writestr("quality/baseline-compliance.json", json.dumps(comp, ensure_ascii=False))
+        return str(path)
+
+    ok = _pack(tmp_path / "ok.zip", ["triggers", "causes", "results_in", "precedes"])
+    v = LocalPack(ok).verify_baseline()
+    g = {x["item"]: x["verdict"] for x in v["baseline"]["gates"]}
+    assert g.get("kinetic_chain_kinds") == "PASS", g
+    thin = _pack(tmp_path / "thin.zip", ["triggers", "triggers", "triggers"])
+    v2 = LocalPack(thin).verify_baseline()
+    g2 = {x["item"]: x["verdict"] for x in v2["baseline"]["gates"]}
+    assert g2.get("kinetic_chain_kinds") == "FAIL", g2
+    assert "kinetic_chain_kinds" in v2["below_baseline"]
