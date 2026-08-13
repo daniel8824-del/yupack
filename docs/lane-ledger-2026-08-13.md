@@ -77,3 +77,11 @@
 - 코덱스(Luna high) P4 발주: stale 문구·discovery 노트팩·hydrate 폴더 분기·pack-contract v1(3항 대조)·테스트·플러그인 표면. 자기신고 "81 passed" — 게이트 재실행에서 1 FAIL 검출.
 - 게이트 정정: 코덱스가 넣은 qmd INDEX_PATH/QMD_CONFIG_DIR 격리가 미캘리브레이션 qmd를 만들어 오프토픽에 0.88 쓰레기 점수 → grounded 오탐. 실설정 qmd 실측으로 반증(오프토픽 vec 0건·정상 거절). 격리 제거, "프로덕션 경로 검증은 실컴포넌트 그대로" 원칙 주석 봉인. 재게이트 81/81 GREEN.
 - 플러그인(/Users/yedulab/plugins/yupack-mcp)은 git 저장소 아님 — 파일 갱신만.
+
+## 저녁 2 — 북팩 레인 발주 착지: 게이트9·suspect·봉인 (6e32524 전달문)
+- T1 게이트9 quote-in-span: verify_baseline(source_path) 재계산(정규화 대조: 공백·스마트따옴표·소문자) / 원문 부재 시 anchor-check.json green 검증 + "재계산 아님" 정직 표기 / 둘 다 있으면 교차 대조(declared green vs 재계산 실패 = declared_mismatch).
+- T2 suspect 2종: uniform_per_chapter_count(장≥5·개수 유니크≤2), floor_landing(하한 ±5% 착지) — SUSPECT 표기만, 차단 아님.
+- T3 승계: 유팩 몫은 T1이 승계분 구분 없이 동일 대조하는 것으로 커버 (재저작 큐는 저작 레인 소관).
+- T4 봉인: build_queryable이 anchor-check red면 error로 거부, 부재면 anchor_warning(구팩 하위호환). 팩 트리 보존은 기존 경로.
+- 노트팩 지원: verify_baseline이 is_notepack이면 파싱된 nodes/adj/evidence로 동일 대조 — 12권째(노트팩 정본) 컴파일 게이트 성립.
+- 테스트 5종 추가(기억 인용 적발·3태·suspect·봉인 거부·노트팩), 86/86 GREEN.

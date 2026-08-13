@@ -1335,17 +1335,19 @@ def pack_status(pack_handle: str) -> dict:
 
 
 @mcp.tool()
-def pack_verify_baseline(pack_handle: str) -> dict:
+def pack_verify_baseline(pack_handle: str, source_path: str = "") -> dict:
     """팩 품질층(quality/*.json)의 자기 신고를 nodes/edges/인덱스에서 재계산해 대조한다.
 
     신고를 그대로 믿지 않는다: 어긋나면 FAIL(declared_mismatch, 조작 탐지),
     핵심 기준 위반이면 FAIL(below_baseline), 품질층이 없으면 absent(구세대 팩, 오류 아님).
+    source_path(원문 텍스트 경로)를 주면 게이트9 quote-in-span(앵커 실재)을 직접
+    재계산하고, 없으면 팩 내장 quality/anchor-check.json의 green 여부로 대체한다.
     유팩은 읽기 도구다 — 판정만 하고 팩을 수정하지 않는다."""
     from . import local_pack
     pk = local_pack.get(pack_handle)
     if not pk:
         return {"error": f"핸들 없음: {pack_handle}"}
-    return {**pk.verify_baseline(), "source_revision": SOURCE_REVISION}
+    return {**pk.verify_baseline(source_path or None), "source_revision": SOURCE_REVISION}
 
 
 @mcp.tool()

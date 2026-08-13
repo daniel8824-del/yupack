@@ -288,6 +288,21 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
     nodes_t = read("nodes.jsonl")
     if not nodes_t:
         return {"error": "source zip에 nodes.jsonl이 없습니다."}
+    # 발주 T4 (2026-08-13): 봉인 순서 — anchor-check red면 봉인 무효.
+    # 게이트 green 전 자가 봉인 zip을 빌드 시점에 차단한다 (실사례 2개 폐기).
+    anchor_warning = None
+    anchor_t = read("quality/anchor-check.json", "")
+    if anchor_t:
+        try:
+            _qs = (json.loads(anchor_t).get("quote_in_span") or {})
+        except ValueError:
+            return {"error": "quality/anchor-check.json 파싱 실패 — 스키마를 고친 뒤 봉인하세요."}
+        if _qs.get("checked") and _qs.get("passed") != _qs.get("checked"):
+            return {"error": ("anchor-check.json이 red입니다 — 게이트 green 전 봉인은 무효 "
+                              f"(quote_in_span {_qs.get('passed')}/{_qs.get('checked')}). "
+                              "실패 Evidence를 재저작한 뒤 다시 봉인하세요.")}
+    else:
+        anchor_warning = "quality/anchor-check.json 없음 (구팩 하위호환 — 신규 저작은 필수)"
     edges_t = read("edges.jsonl")
     evidence_t = read("evidence.jsonl")
     reviews_t = read("reviews.jsonl")
@@ -527,8 +542,11 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zo:
         for name, data in sorted(files.items()):
             zo.writestr(name, data)
-    return {"out_zip": out_zip, "counts": counts, "embeddings": emb_status,
-            "files": sorted(files)}
+    result = {"out_zip": out_zip, "counts": counts, "embeddings": emb_status,
+              "files": sorted(files)}
+    if anchor_warning:
+        result["anchor_warning"] = anchor_warning
+    return result
 
 
 # ======================= 오픈/질의 =======================
@@ -881,23 +899,35 @@ class LocalPack:
     _BASELINE_RECOMPUTABLE = ("all_edges_resolve", "unique_nodes", "unique_evidence",
                               "fts_count_matches_nodes", "openai_vector_materialized")
 
-    def verify_baseline(self) -> dict:
-        """quality/ 자기 신고를 nodes/edges/인덱스에서 재계산해 대조한다 (T3).
+    def verify_baseline(self, source_path: str | None = None) -> dict:
+        """quality/ 자기 신고를 nodes/edges/인덱스에서 재계산해 대조한다 (T3 + 게이트9).
 
         신고를 그대로 믿지 않는다. 재계산과 어긋나면 FAIL(declared_mismatch, 조작 탐지),
         핵심 기준을 어기면 FAIL(below_baseline), 문서가 없으면 absent (오류 아님).
         neo4j·qmd 컬렉션 같은 환경 주장은 zip만으로 재계산 불가 — unverifiable로 표시만 한다.
+        source_path(원문 텍스트)가 오면 게이트9 quote-in-span을 직접 재계산하고,
+        없으면 팩 내장 quality/anchor-check.json의 green 여부 검증으로 대체한다(정직 표기).
+        노트팩은 파싱된 nodes/adj/evidence로 같은 대조를 수행한다.
         """
         docs = self._quality_docs()
         if not docs:
             return {"status": "absent", "present": False,
                     "note": "quality/ 문서가 없는 팩 (구세대 정본 하위호환) — 오류 아님"}
-        nodes_p = _jsonl(self._read("nodes.jsonl"))
-        edges_p = _jsonl(self._read("edges.jsonl"))
+        if getattr(self, "is_notepack", False):
+            nodes_p = [{"id": i, "space": n.get("space"), "node_type": n.get("node_type"),
+                        "properties": n.get("properties") or {}}
+                       for i, n in self.nodes.items()]
+            edges_p = [{"source": s, "target": t, "relation": r}
+                       for s, lst in self.adj.items() for r, t in lst
+                       if not str(r).startswith("~")]
+            ev_rows = [{"evidence_id": eid, **(e or {})} for eid, e in self.evidence.items()]
+        else:
+            nodes_p = _jsonl(self._read("nodes.jsonl"))
+            edges_p = _jsonl(self._read("edges.jsonl"))
+            ev_rows = _jsonl(self._read("evidence.jsonl"))
         node_ids = [n.get("id") for n in nodes_p]
         node_set = set(node_ids)
-        ev_ids = [e.get("evidence_id") or e.get("id")
-                  for e in _jsonl(self._read("evidence.jsonl"))]
+        ev_ids = [e.get("evidence_id") or e.get("id") for e in ev_rows]
         unresolved, touched = [], set()
         for e in edges_p:
             s, t = e.get("source") or e.get("from_id"), e.get("target") or e.get("to_id")
@@ -1013,8 +1043,9 @@ class LocalPack:
             unverified_gates = []
             body_end = comp.get("source_body_end_line")
             spans = []  # (id, start, end, chapter)
-            for r_ in _jsonl(self._read("evidence.jsonl")):
-                loc = r_.get("locator") if isinstance(r_.get("locator"), dict) else {}
+            for r_ in ev_rows:
+                loc = r_.get("locator") if isinstance(r_.get("locator"), dict) else \
+                    (r_.get("source_locator") if isinstance(r_.get("source_locator"), dict) else {})
                 a_ = loc.get("start_line") or loc.get("line_start")
                 b_ = loc.get("end_line") or loc.get("line_end")
                 if isinstance(a_, int) and isinstance(b_, int):
@@ -1048,6 +1079,26 @@ class LocalPack:
             gate_items.append({"item": "uniform_slicing",
                                "recomputed": f"suspect 장 {len(slicing_suspects)}",
                                "verdict": "SUSPECT" if slicing_suspects else "PASS"})
+            # 기계 패턴 suspect 2종 (발주 2026-08-13 T2 — 차단 아님, 정독 지정):
+            # ① 장당 Evidence 개수가 전 장 거의 동일 = 캡 걸린 기계 추출
+            #   (실측: 24권 중 23권이 정확히 8개. 정상 저작은 6/8/6/5처럼 원문 따라 가변)
+            ch_counts = {c_: len(sz) for c_, sz in by_ch.items() if c_ is not None}
+            if len(ch_counts) >= 5 and len(set(ch_counts.values())) <= 2:
+                gate_items.append({"item": "uniform_per_chapter_count",
+                                   "recomputed": f"{len(ch_counts)}개 장, 개수 종류 "
+                                                 f"{sorted(set(ch_counts.values()))}",
+                                   "verdict": "SUSPECT"})
+            # ② 총량이 하한 ±5% 정확 착지 = 하한 맞추기 저작 의심
+            #   (하한은 경보선 — 정상 저작 실측 대역 20~30/천행, 예: 앤 30.2)
+            _floors = comp.get("floors") or {}
+            _f_ev = _floors.get("evidence") or _floors.get("evidence_per_1000")
+            _p_ev = per_rc.get("evidence")
+            if (isinstance(_f_ev, (int, float)) and _f_ev > 0
+                    and isinstance(_p_ev, (int, float))
+                    and abs(_p_ev - _f_ev) / _f_ev <= 0.05):
+                gate_items.append({"item": "floor_landing",
+                                   "recomputed": f"evidence {_p_ev}/천행, 하한 {_f_ev} ±5% 내",
+                                   "verdict": "SUSPECT"})
             below.extend(g["item"] for g in gate_items
                          if g["verdict"] == "FAIL" and g["item"] not in below)
             baseline = {"profile": comp.get("profile"), "declared_passed": comp.get("passed"),
@@ -1061,6 +1112,80 @@ class LocalPack:
                         "locator_over_sample": locator_over[:4],
                         "uniform_slicing_suspects": slicing_suspects[:6]}
 
+        # ── 게이트 9 (발주 2026-08-13 채록): quote-in-span 앵커 실재 ──
+        # 인용이 선언한 행 범위의 원문에 실제로 있는가. SHA·개수 자가검증이 못 잡는
+        # 기억 인용·행 드리프트·무검증 승계를 원문 정규화 대조 한 방으로 적발한다.
+        def _norm_anchor(s: str) -> str:
+            s = re.sub(r"[“”]", '"', re.sub(r"[‘’]", "'", str(s)))
+            return re.sub(r"\s+", " ", s).strip().lower()
+        props_by_id = {n.get("id"): (n.get("properties") or {}) for n in nodes_p}
+        anchor_rel = next((rel for rel in docs if rel.endswith("anchor-check.json")), None)
+        anchor_doc = docs.get(anchor_rel) if anchor_rel else None
+        if isinstance(anchor_doc, dict) and anchor_doc.get("_unparseable"):
+            anchor_doc = None
+        src_text = None
+        if source_path:
+            try:
+                src_text = open(os.path.expanduser(source_path), encoding="utf-8",
+                                errors="ignore").read()
+            except OSError:
+                src_text = None
+        if src_text is not None:
+            src_l = src_text.splitlines()
+            checked = passed_n = no_anchor = 0
+            anchor_failures = []
+            for r_ in ev_rows:
+                loc = r_.get("locator") if isinstance(r_.get("locator"), dict) else \
+                    (r_.get("source_locator") if isinstance(r_.get("source_locator"), dict) else {})
+                a_ = loc.get("start_line") or loc.get("line_start")
+                b_ = loc.get("end_line") or loc.get("line_end")
+                rid = r_.get("evidence_id") or r_.get("id")
+                p_ = props_by_id.get(rid) or {}
+                quote = (r_.get("short_quote") or r_.get("source_marker")
+                         or p_.get("short_quote") or p_.get("source_marker"))
+                if not (isinstance(a_, int) and isinstance(b_, int) and quote):
+                    no_anchor += 1
+                    continue
+                checked += 1
+                span = " ".join(src_l[max(a_ - 1, 0):b_])
+                if _norm_anchor(quote) in _norm_anchor(span):
+                    passed_n += 1
+                else:
+                    anchor_failures.append({"id": rid, "span": [a_, b_]})
+            anchor = {"mode": "recomputed", "checked": checked, "passed": passed_n,
+                      "no_anchor": no_anchor, "failures": anchor_failures[:8]}
+            if isinstance(anchor_doc, dict):
+                sha = anchor_doc.get("source_sha256")
+                if sha:
+                    anchor["source_sha256_match"] = (
+                        sha == _sha256(src_text.encode()))
+                qs = anchor_doc.get("quote_in_span") or {}
+                if qs.get("checked") and qs.get("passed") == qs.get("checked") \
+                        and anchor_failures:
+                    mismatches.append({"file": anchor_rel, "check": "quote_in_span",
+                                       "declared": "green",
+                                       "recomputed": f"실패 {len(anchor_failures)}/{checked}"})
+            if anchor_failures:
+                below.append("quote_in_span")
+        elif isinstance(anchor_doc, dict):
+            qs = anchor_doc.get("quote_in_span") or {}
+            schema_ok = all(k in anchor_doc for k in
+                            ("source_sha256", "source_body_end_line", "quote_in_span"))
+            green = (schema_ok and isinstance(qs.get("checked"), int) and qs["checked"] > 0
+                     and qs.get("passed") == qs["checked"])
+            anchor = {"mode": "declared", "schema_ok": schema_ok, "green": green,
+                      "checked": qs.get("checked"), "passed": qs.get("passed"),
+                      "note": "재계산 아님(내장 산출 신뢰) — source_path를 주면 재계산 대조"}
+            if not schema_ok:
+                mismatches.append({"file": anchor_rel, "check": "anchor_schema",
+                                   "declared": sorted(anchor_doc),
+                                   "recomputed": "필수 키 누락"})
+            elif not green:
+                below.append("quote_in_span_declared_red")
+        else:
+            anchor = {"mode": "absent",
+                      "note": "anchor-check.json 없음 (구팩 하위호환) — 오류 아님"}
+
         if mismatches:
             status, reason = "FAIL", "declared_mismatch"
         elif below:
@@ -1069,7 +1194,7 @@ class LocalPack:
             status, reason = "PASS", None
         return {"status": status, "present": True, "reason": reason,
                 "files": sorted(docs), "recomputed": recomputed,
-                "baseline": baseline,
+                "baseline": baseline, "anchor": anchor,
                 "mismatches": mismatches[:8], "below_baseline": below,
                 "unverifiable_checks": sorted(unverifiable),
                 "unresolved_edges_sample": unresolved[:4]}

@@ -259,3 +259,136 @@ def test_existing_final_packs_no_false_tamper(monkeypatch):
             honest_fails.append((os.path.basename(p), v["below_baseline"][:3]))
     assert not false_tamper, false_tamper
     # 정직한 미달은 정보로만 (증보 중간물 등) — 존재 자체는 실패가 아니다
+
+
+# ── 게이트9 + suspect + 봉인 (발주 2026-08-13: prompt-yupack-authoring-quality-gates) ──
+
+SRC_TEXT = "\n".join([
+    "제1장",
+    "오디세우스는 트로이에서 돌아오는 길에 폭풍을 만났다.",
+    "바다의 신이 그의 귀향을 십 년 동안 막았다.",
+    "제2장",
+    "그는 이름을 밝힌 대가로 표류를 얻었다.",
+])
+
+
+def _anchor_zip(path, evidence, *, anchor=None, quality=None):
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("nodes.jsonl", "\n".join(json.dumps(n, ensure_ascii=False) for n in NODES))
+        z.writestr("edges.jsonl", "\n".join(json.dumps(e, ensure_ascii=False) for e in EDGES))
+        z.writestr("evidence.jsonl", "\n".join(json.dumps(e, ensure_ascii=False) for e in evidence))
+        z.writestr("reviews.jsonl", "")
+        z.writestr("quality/finalization.json", json.dumps(
+            quality or {"checks": {"all_edges_resolve": True}, "counts": {"nodes": 2, "edges": 1}},
+            ensure_ascii=False))
+        if anchor is not None:
+            z.writestr("quality/anchor-check.json", json.dumps(anchor, ensure_ascii=False))
+    return str(path)
+
+
+def test_gate9_quote_in_span_recomputes_and_catches_memory_quote(tmp_path, monkeypatch):
+    """원문 대조: 스팬 안 인용은 PASS, 기억 인용(스팬 밖)은 그 한 방으로 FAIL."""
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+    src_txt = tmp_path / "source.txt"
+    src_txt.write_text(SRC_TEXT, encoding="utf-8")
+    good = {"evidence_id": "ev:1", "summary": "귀향 방해",
+            "locator": {"start_line": 2, "end_line": 3},
+            "short_quote": "바다의 신이 그의 귀향을 십 년 동안 막았다."}
+    z = _anchor_zip(tmp_path / "ok.zip", [good])
+    v = LocalPack(z).verify_baseline(str(src_txt))
+    assert v["anchor"]["mode"] == "recomputed"
+    assert v["anchor"] == {**v["anchor"], "checked": 1, "passed": 1}
+    assert v["status"] == "PASS", v
+    # 기억 인용: 원문에 없는 문장을 같은 스팬에 선언
+    bad = {**good, "short_quote": "그는 바다를 저주하며 울부짖었다."}
+    z2 = _anchor_zip(tmp_path / "bad.zip", [bad])
+    v2 = LocalPack(z2).verify_baseline(str(src_txt))
+    assert v2["status"] == "FAIL" and "quote_in_span" in v2["below_baseline"]
+    assert v2["anchor"]["failures"][0]["id"] == "ev:1"
+
+
+def test_gate9_declared_modes_green_red_absent(tmp_path, monkeypatch):
+    """원문 없이: 내장 anchor-check green은 신뢰(정직 표기), red는 FAIL, 부재는 하위호환."""
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+    ev = [{"evidence_id": "ev:1", "summary": "근거", "locator": {"start_line": 2, "end_line": 3}}]
+    green = {"source_sha256": "x" * 64, "source_body_end_line": 5,
+             "per_chapter_counts": {"1": 1}, "quote_in_span": {"checked": 9, "passed": 9},
+             "generated_at_rev": "test"}
+    v = LocalPack(_anchor_zip(tmp_path / "g.zip", ev, anchor=green)).verify_baseline()
+    assert v["anchor"]["mode"] == "declared" and v["anchor"]["green"] is True
+    assert "재계산 아님" in v["anchor"]["note"] and v["status"] == "PASS"
+    red = {**green, "quote_in_span": {"checked": 30, "passed": 20}}
+    v2 = LocalPack(_anchor_zip(tmp_path / "r.zip", ev, anchor=red)).verify_baseline()
+    assert v2["status"] == "FAIL" and "quote_in_span_declared_red" in v2["below_baseline"]
+    v3 = LocalPack(_anchor_zip(tmp_path / "a.zip", ev)).verify_baseline()
+    assert v3["anchor"]["mode"] == "absent" and v3["status"] == "PASS"
+
+
+def test_suspect_uniform_chapter_count_and_floor_landing(tmp_path, monkeypatch):
+    """기계 패턴 suspect: 장당 고정 개수 + 총량 하한 정확 착지 — 차단 아닌 정독 지정."""
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+    nodes = [{"id": "per:a", "space": "concept", "node_type": "Person",
+              "properties": {"label": "A"}}]
+    evidence, edges = [], []
+    sizes = [3, 9, 21, 45]  # 장 내 구간 크기는 출렁이게 (gate8 CV 간섭 차단)
+    line = 1
+    for ch in range(1, 6):          # 5개 장 × 정확히 4개 = 유니크 {4}
+        for i, sz in enumerate(sizes):
+            eid = f"ev:{ch}-{i}"
+            nodes.append({"id": eid, "space": "evidence", "node_type": "TextUnit",
+                          "properties": {"label": eid}})
+            evidence.append({"evidence_id": eid, "summary": "s",
+                             "locator": {"start_line": line, "end_line": line + sz - 1,
+                                          "chapter": f"c{ch}"}})
+            edges.append({"source": eid, "target": "per:a", "relation": "describes",
+                          "properties": {}})
+            line += sz
+    comp = {"profile": "test", "passed": True, "source_lines": 1000,
+            "source_body_end_line": 1000,
+            "measured": {"evidence": 20, "kinetic": 0, "theme": 0, "claim": 0,
+                          "grammar_kinds": 1,
+                          "per_1000": {"evidence": 20.0, "kinetic": 0.0}},
+            "floors": {"evidence": 20}}   # 20/천행 정확 착지 → suspect
+    p = tmp_path / "s.zip"
+    with zipfile.ZipFile(p, "w") as z:
+        z.writestr("nodes.jsonl", "\n".join(json.dumps(n, ensure_ascii=False) for n in nodes))
+        z.writestr("edges.jsonl", "\n".join(json.dumps(e, ensure_ascii=False) for e in edges))
+        z.writestr("evidence.jsonl", "\n".join(json.dumps(e, ensure_ascii=False) for e in evidence))
+        z.writestr("reviews.jsonl", "")
+        z.writestr("quality/baseline-compliance.json", json.dumps(comp, ensure_ascii=False))
+    v = LocalPack(str(p)).verify_baseline()
+    verdicts = {g["item"]: g["verdict"] for g in v["baseline"]["gates"]}
+    assert verdicts.get("uniform_per_chapter_count") == "SUSPECT", verdicts
+    assert verdicts.get("floor_landing") == "SUSPECT", verdicts
+    assert verdicts.get("uniform_slicing") == "PASS", verdicts
+    assert v["status"] == "PASS", v  # suspect는 차단이 아니다
+
+
+def test_t4_build_queryable_refuses_red_anchor_and_warns_absent(tmp_path, monkeypatch):
+    """봉인 순서: 게이트 red 상태의 자가 봉인은 빌드 시점에 무효."""
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+    red = {"source_sha256": "x" * 64, "source_body_end_line": 5,
+           "quote_in_span": {"checked": 30, "passed": 20}}
+    z = _anchor_zip(tmp_path / "red.zip", EVIDENCE, anchor=red)
+    r = build_queryable(z, str(tmp_path / "out.zip"), include_embeddings=False)
+    assert "error" in r and "red" in r["error"]
+    z2 = _anchor_zip(tmp_path / "old.zip", EVIDENCE)
+    r2 = build_queryable(z2, str(tmp_path / "out2.zip"), include_embeddings=False)
+    assert "error" not in r2 and "anchor_warning" in r2
+
+
+def test_gate9_works_on_notepack(tmp_path, monkeypatch):
+    """12권째 정본은 노트팩 — verify_baseline이 폴더에서도 같은 대조를 수행한다."""
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+    from test_notepack_loader import _build_fixture
+    root = str(tmp_path / "note-pack")
+    _build_fixture(root)
+    qdir = os.path.join(root, "quality")
+    os.makedirs(qdir)
+    json.dump({"source_sha256": "x" * 64, "source_body_end_line": 9999,
+               "per_chapter_counts": {}, "quote_in_span": {"checked": 5, "passed": 5},
+               "generated_at_rev": "t"},
+              open(os.path.join(qdir, "anchor-check.json"), "w", encoding="utf-8"))
+    v = LocalPack(root).verify_baseline()
+    assert v["present"] is True and v["anchor"]["mode"] == "declared"
+    assert v["anchor"]["green"] is True and v["status"] == "PASS", v
