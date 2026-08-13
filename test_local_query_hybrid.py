@@ -9,17 +9,12 @@ from yupack_mcp.local_pack import LocalPack
 from yupack_mcp.local_pack import _pick_model, _qmd_collection_name
 
 
-def test_keyless_default_is_local_bge_m3_not_qmd():
+def test_keyless_default_is_local_bge_m3_not_qmd(monkeypatch, tmp_path):
     """QMD는 볼트 검색용이다. 무키 Yupack 기본은 OMLX bge-m3여야 한다."""
-    old_model = os.environ.pop("YUPACK_EMBED_MODEL", None)
-    old_key = os.environ.pop("OPENAI_API_KEY", None)
-    try:
-        assert _pick_model() == ("bge-m3", 1024)
-    finally:
-        if old_model is not None:
-            os.environ["YUPACK_EMBED_MODEL"] = old_model
-        if old_key is not None:
-            os.environ["OPENAI_API_KEY"] = old_key
+    monkeypatch.delenv("YUPACK_EMBED_MODEL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("YUPACK_SETTINGS", str(tmp_path / "unset-settings.json"))
+    assert _pick_model() == ("bge-m3", 1024)
 
 
 def test_qmd_collection_name_keeps_korean_pack_ids_distinct():

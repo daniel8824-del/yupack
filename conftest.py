@@ -3,7 +3,8 @@
 게이트 자체의 동작(인터뷰·일일 확인·백엔드 재질문)은 test_settings_gate.py가
 YUPACK_SETTINGS를 직접 제어해 검증한다. 여기서는 나머지 테스트가 게이트에
 걸리지 않도록, 오늘 확인이 끝난 설정 파일을 세션 전체에 물려준다.
-embed_model은 기존 기본값과 같은 bge-m3로 두어 임베딩 테스트 동작을 보존한다.
+embed_model은 외부 백엔드가 없어도 저장·게이트 테스트가 결정적으로 돌도록 none으로 둔다.
+QMD E2E는 테스트 안에서 사용자가 qmd를 고르는 인터뷰를 별도로 재현한다.
 """
 import json
 import os
@@ -26,7 +27,7 @@ def _configured_yupack_settings():
     path = Path(td) / "settings.json"
     path.write_text(json.dumps({
         "pack_dir": td,
-        "embed_model": os.environ.get("YUPACK_EMBED_MODEL") or "bge-m3",
+        "embed_model": os.environ.get("YUPACK_EMBED_MODEL") or "none",
         "confirm_interval": "never",
     }, ensure_ascii=False), encoding="utf-8")
     os.environ["YUPACK_SETTINGS"] = str(path)

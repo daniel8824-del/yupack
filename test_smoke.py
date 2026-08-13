@@ -12,7 +12,7 @@ def test_app_routes():
     paths = [r.path for r in app.router.routes]
     assert any(p.startswith("/mcp") for p in paths), paths
     assert any(p.startswith("/sse") for p in paths), paths
-    assert "/download/{token}" in paths, paths
+    assert "/upload" in paths, paths
 
 
 def test_manifest():

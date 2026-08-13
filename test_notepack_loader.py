@@ -84,6 +84,46 @@ def test_notepack_frontmatter_edgecases(tmp_path, monkeypatch):
     assert list(lp.nodes) == ["topic:1"]  # MOC·무프론트매터 문서는 노드가 아니다
 
 
+def test_notepack_discovery_and_listing(tmp_path, monkeypatch):
+    import yupack_mcp.server as S
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+    refresh_embed_model()
+    shelf = tmp_path / "shelf"
+    root = shelf / "작품" / "note-pack"
+    _build_fixture(str(root))
+
+    selected = S._verified_final_pack_paths(str(shelf))
+    assert selected == [str(root)]
+    listed = S.pack_list_local(str(shelf))
+    assert any(p["path"] == str(root) and p["type"] == "notepack"
+               for p in listed["packs"]), listed
+
+
+def test_saved_notepack_has_contract_and_clean_status(tmp_path, monkeypatch):
+    import json
+    import yupack_mcp.server as S
+    from quality_fixture import fill_quality_floor
+
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+    refresh_embed_model()
+    pack = "노트팩계약검증"
+    S.PACKS.pop(pack, None)
+    S.PACK_DESTINATIONS.pop(pack, None)
+    try:
+        S.pack_create(pack, save_to=str(tmp_path))
+        fill_quality_floor(S, pack)
+        saved = S.pack_save(pack, include_embeddings=False)
+        contract_path = os.path.join(saved["saved_to"], "quality", "pack-contract.json")
+        assert os.path.isfile(contract_path)
+        contract = json.loads(open(contract_path, encoding="utf-8").read())
+        assert contract["format"] == "yupack-pack-contract-v1"
+        status = LocalPack(saved["saved_to"]).status()
+        assert status["contract"] == {"present": True, "violations": 0}
+    finally:
+        S.PACKS.pop(pack, None)
+        S.PACK_DESTINATIONS.pop(pack, None)
+
+
 def test_migrate_zip_to_notepack(tmp_path, monkeypatch):
     """P3: 기존 zip 정본 → 노트팩 충실 이행 (zip 보존, 노드 수 일치 실측)."""
     import json
@@ -116,8 +156,10 @@ def test_migrate_zip_to_notepack(tmp_path, monkeypatch):
     assert r["format"] == "notepack" and r["faithful"] is True, r
     assert r["counts"]["zip_nodes"] == r["counts"]["note_nodes"] == 3
     assert os.path.isfile(os.path.join(r["saved_to"], "quality", "finalization.json"))
+    assert os.path.isfile(os.path.join(r["saved_to"], "quality", "pack-contract.json"))
     assert os.path.isfile(src)  # zip 보존 (이행기 하위호환)
     lp = LocalPack(r["saved_to"])
+    assert lp.status()["contract"]["violations"] == 0
     ans = lp.ask("근거 본문은 무엇을 말하나?", 3)
     assert ans["status"] == "grounded"
     # 재이행은 묻지 않고 덮지 않는다
