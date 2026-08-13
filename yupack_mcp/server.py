@@ -1,8 +1,7 @@
 """yupack: 수업용 팩 공방 MCP 서버.
 
 핵심 원칙: 모든 쓰기는 팩 버퍼(PACKS) + 로컬 SQLite에만 간다. 외부 프로덕션 DB(Neo4j)에는
-절대 쓰지 않는다 (읽기 전용 Cypher만). pack_save는 정본 임포터 계약 zip(nodes.jsonl +
-edges.jsonl + pack.yaml)을 꺼내 준다.
+절대 쓰지 않는다 (읽기 전용 Cypher만). pack_save는 옵시디언 노트팩 폴더를 만든다.
 """
 from __future__ import annotations
 import datetime
@@ -26,7 +25,7 @@ from . import yucrates_contract
 # 클라이언트 모델이 "로컬 파일을 다뤄도 되나"를 추측하지 않도록 서버 성격을
 # initialize 단계에서 사실대로 알려준다. 없으면 모르는 쪽으로 기울어 오거절한다.
 _INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 로컬 MCP 서버입니다.
-온톨로지 팩(노드·엣지)을 만들고 zip 하나로 주고받는 개인용 공방입니다.
+노드·엣지·근거를 옵시디언 노트팩으로 펼치는 개인용 공방입니다.
 
 데이터 취급:
 - 쓰기는 로컬 팩 버퍼와 로컬 SQLite에만 갑니다. 외부 프로덕션 DB에는 쓰지 않습니다(읽기 전용 조회만).
@@ -40,28 +39,29 @@ _INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 �
   뒤 사용하세요. 미리 정의된 묶음은 schema_pack_install(saas/biomedical/legal/finance)로 설치합니다.
 - ontology_ingest의 source_id는 출처 표시입니다. 텍스트 노드 ID로 쓰이지 않으며(자동 text: ID 발급),
   출처 노드가 있으면 contains 엣지가 자동 연결됩니다.
-- 저장 전 pack_qa로 팩 전체를 검사하세요. pack_save는 qa 리포트와 표준 계약 파일
-  (manifest.json, graph/, evidence/, quality/, neo4j/import.cypher)을 zip에 동봉합니다.
-- 저장된 팩을 이어서 편집하려면 pack_open_local(zip_path, mode="authoring")로 여세요.
+- 저장 전 pack_qa로 팩 전체를 검사하세요. pack_save는 노트팩 폴더(노트+MOC+quality/ledger.json+
+  quality/pack-contract.json)를 만듭니다.
+- 저장된 팩을 이어서 편집하려면 경로(zip 또는 note-pack 폴더)를
+  pack_open_local(path, mode="authoring")으로 여세요.
   반환된 authoring_pack 이름으로 add_node/pack_qa/pack_save가 이어집니다.
   (읽기 핸들 pack_xxxx는 질의 전용이며 저작 버퍼가 아닙니다.)
 - 말뭉치가 외국어(영어 원문 등)인 팩은 핵심 노드 properties에 label_ko(한국어 이름)와
   aliases_ko(별칭 목록)를 달아 두세요. 검색 인덱스에 포함되어 한국어 질의가 직접 걸립니다.
   저장 후에는 embeddings count가 0이 아닌지 확인하세요 (0이면 의미 질의 비활성).
-- 도구 구분: 열린 zip 질의는 pack_ask_local(3중 검색 + graph_path), ontology_query는
+- 도구 구분: 열린 팩 질의는 pack_ask_local(3중 검색 + graph_path), ontology_query는
   저작 버퍼 전용입니다. read_only 핸들에 ontology_query를 쓰면 그래프가 비어 나옵니다.
-  다른 MCP 서버(유크라테스 엔진)의 query_bm25 등은 팩(zip)과 무관하니 팩 질문에 쓰지 마세요.
+  다른 MCP 서버(유크라테스 엔진)의 query_bm25 등은 팩과 무관하니 팩 질문에 쓰지 마세요.
 - 팩 경로를 모르거나 열기에 실패하면 pack_list_local()로 팩 서랍(홈에서 자동 탐색)을
   스캔하세요. verified_final_packs만 정본 후보이며, improved/request/draft ZIP은 자동 선택하지 않습니다.
-- 환경변수 YUPACK_AUTO_OPEN에 zip 경로 또는 "library"가 있으면 서버가 시작할 때 엽니다.
+- 환경변수 YUPACK_AUTO_OPEN에 팩 경로(zip/노트팩 폴더) 또는 "library"가 있으면 서버가 시작할 때 엽니다.
   library에 정본이 여러 개면 작품을 추측해 열지 않고 선택 후보를 돌려줍니다.
-- 팩 서랍의 PACK-CHARTER.md(팩 생산 헌장)는 저장 시 자동 동봉됩니다. 저작 전에 한 번 읽으세요.
-- 임베딩: Yupack의 기본은 로컬 OMLX bge-m3(1024차원)이며 API 키가 필요 없습니다.
-  OMLX가 꺼져 있으면 어휘+그래프로만 동작한다고 명시합니다. QMD는 볼트 검색 도구이며
-  `YUPACK_EMBED_MODEL=qmd`를 사용자가 명시한 호환 모드에서만 씁니다.
+- 팩 서랍의 PACK-CHARTER.md(팩 생산 헌장)는 저작 전에 한 번 읽으세요.
+- 임베딩·색인은 qmd가 볼트 차원에서 자동 수행합니다(유팩은 qmd를 조작하지 않음).
+  Yupack의 기본 질의 백엔드는 로컬 OMLX bge-m3(1024차원)이며 API 키가 필요 없습니다.
+  OMLX가 꺼져 있으면 어휘+그래프로만 동작한다고 명시합니다.
 - 무키 저작: 원문을 읽고 구조화하는 저작자는 이 도구를 호출한 ChatGPT/Claude다. 유팩은
   원문 Evidence를 보존하고, 호스트가 추가한 Claim·Kinetic·관계를 그래머와 근거 연결로
-  검증한다. `pack_authoring_complete`가 통과하기 전에는 ZIP을 저장하지 않는다. OMLX가
+  검증한다. `pack_authoring_complete`가 통과하기 전에는 노트팩을 저장하지 않는다. OMLX가
   원문을 대신 읽어 경량 노드를 자동 생성하지 않는다.
 - 답변 규율: 팩 근거로 말하는 문장에는 근거 id를 표기하고, 팩에 없는 배경지식으로 보충할 때는
   그 부분이 '일반 지식'임을 구분해 밝히세요. 팩 근거와 일반 지식을 한 문장에 섞지 마세요.
@@ -91,7 +91,6 @@ DEFAULT_PACK = "내팩"
 # 플러그인 정의나 소스 코드의 하드코딩 값이 아니다.
 PACK_DESTINATIONS: dict[str, str] = {}
 
-_BUNDLES: dict[str, bytes] = {}  # token -> zip bytes (pack_save 다운로드)
 
 _PRIVATE_PREFIXES = ("personal:", "zzdemo:", "class:test:")
 
@@ -271,111 +270,6 @@ def _qa_scan(pack: str) -> dict:
         "advisories": advisories,
         "issues": issues,
     }
-
-
-def _cy(v) -> str:
-    """Cypher 문자열 리터럴 (json 이스케이프는 Cypher와 호환)."""
-    return json.dumps(str(v), ensure_ascii=False)
-
-
-def _contract_files(pack: str, buf: dict, today: str, qa: dict) -> dict[str, str]:
-    """opencrab-pack-v1 계약 아티팩트를 생성한다: manifest.json + graph/ + evidence/ +
-    quality/ + neo4j/import.cypher. (opencrab_ingest.jsonl은 Neo4j 통과 후 추출본이라
-    Neo4j 미접촉인 yupack에서는 만들지 않는다 — yucrates export 몫.)"""
-    ev_refs: dict[str, list] = {}   # node_id -> 연결된 evidence 노드 id들
-    ev_links: dict[str, list] = {}  # evidence_id -> 연결된 비evidence 노드 id들
-    for e in buf["edges"]:
-        for a, b in ((e["from_id"], e["to_id"]), (e["to_id"], e["from_id"])):
-            na, nb = buf["nodes"].get(a), buf["nodes"].get(b)
-            if na and nb and nb["space"] == "evidence" and na["space"] != "evidence":
-                ev_refs.setdefault(a, []).append(b)
-                ev_links.setdefault(b, []).append(a)
-    nodes_l, edges_l, evidence_l, cypher = [], [], [], []
-    for nid, n in buf["nodes"].items():
-        props = n.get("properties", {})
-        nodes_l.append(json.dumps({
-            "id": nid, "label": props.get("label", nid), "space": n["space"],
-            "node_type": n["node_type"], "properties": props,
-            "evidence_refs": ev_refs.get(nid, []),
-            "quality": {"confidence": props.get("confidence"), "promotion_status": "draft"},
-        }, ensure_ascii=False))
-        safe_type = re.sub(r"[^0-9A-Za-z_가-힣]", "_", n["node_type"])
-        cypher.append(f"MERGE (n:`{safe_type}` {{id: {_cy(nid)}}}) "
-                      f"SET n.label = {_cy(props.get('label', nid))}, n.space = {_cy(n['space'])}, "
-                      f"n.node_type = {_cy(n['node_type'])}, n.props_json = {_cy(json.dumps(props, ensure_ascii=False))};")
-        if n["space"] == "evidence":
-            evidence_l.append(json.dumps({
-                "evidence_id": nid, "kind": "text_chunk",
-                "source": {"url": None, "path": None, "title": props.get("source_id") or props.get("label")},
-                "hash": "sha256:" + hashlib.sha256(
-                    (props.get("text") or props.get("definition") or "").encode()).hexdigest(),
-                "collected_at": today,
-                "location": {"document_id": props.get("source_id"), "chunk_index": None},
-                "links": {"document_id": props.get("source_id"),
-                          "node_ids": sorted(set(ev_links.get(nid, [])))},
-            }, ensure_ascii=False))
-    for i, e in enumerate(buf["edges"]):
-        edges_l.append(json.dumps({
-            "id": f"edge:{i}", "from_id": e["from_id"], "to_id": e["to_id"],
-            "from_space": e["from_space"], "to_space": e["to_space"], "relation": e["relation"],
-            "confidence": e.get("properties", {}).get("confidence"),
-            "evidence_refs": sorted(set(ev_refs.get(e["from_id"], []) + ev_refs.get(e["to_id"], []))),
-            "properties": e.get("properties", {}),
-        }, ensure_ascii=False))
-        safe_rel = re.sub(r"[^0-9A-Za-z_]", "_", e["relation"])
-        cypher.append(f"MATCH (a {{id: {_cy(e['from_id'])}}}), (b {{id: {_cy(e['to_id'])}}}) "
-                      f"MERGE (a)-[r:`{safe_rel}`]->(b) "
-                      f"SET r.props_json = {_cy(json.dumps(e.get('properties', {}), ensure_ascii=False))};")
-    nodes_txt, edges_txt, ev_txt = "\n".join(nodes_l), "\n".join(edges_l), "\n".join(evidence_l)
-    non_ev = [nid for nid, n in buf["nodes"].items() if n["space"] != "evidence"]
-    manifest = {
-        "format_version": "opencrab-pack-v1",
-        "pack_id": f"{_safe_filename(pack)}-{today}", "title": pack, "version": "1.0.0",
-        "grammar_version": MANIFEST["version"], "created_at": today, "created_by": "yupack",
-        "license": {"scope": "personal", "name": "proprietary"},
-        "source": {"mode": "manual", "label": pack, "url": None,
-                   "description": "yupack 로컬 공방에서 수동/대화형으로 생산된 팩"},
-        "schema_packs": buf.get("schema_packs", []),
-        "custom_grammar": {"node_types": buf.get("custom_types", {}),
-                           "relations": buf.get("custom_relations", [])},
-        "counts": {"nodes": len(buf["nodes"]), "edges": len(buf["edges"]),
-                   "evidence": len(evidence_l), "documents": 0, "files": 0},
-        "quality": {
-            "evidence_coverage": (sum(1 for nid in non_ev if ev_refs.get(nid)) / len(non_ev)) if non_ev else None,
-            "graph_reference_integrity":
-                1.0 - (qa["counts"]["broken_edges"] / len(buf["edges"]) if buf["edges"] else 0.0),
-            "promotion_status": "validated" if qa["status"] == "pass" else "draft",
-        },
-        "hashes": {"nodes_sha256": hashlib.sha256(nodes_txt.encode()).hexdigest(),
-                   "edges_sha256": hashlib.sha256(edges_txt.encode()).hexdigest(),
-                   "evidence_sha256": hashlib.sha256(ev_txt.encode()).hexdigest()},
-        "artifacts": {"nodes": "graph/nodes.jsonl", "edges": "graph/edges.jsonl",
-                      "evidence_index": "evidence/index.jsonl",
-                      "quality_report": "quality/report.json",
-                      "neo4j_cypher": "neo4j/import.cypher"},
-    }
-    return {
-        "manifest.json": json.dumps(manifest, ensure_ascii=False, indent=1),
-        "graph/nodes.jsonl": nodes_txt,
-        "graph/edges.jsonl": edges_txt,
-        "evidence/index.jsonl": ev_txt,
-        "quality/report.json": json.dumps(qa, ensure_ascii=False, indent=1),
-        "neo4j/import.cypher": "// yupack pack: " + pack + " (" + today + ")\n"
-                               "// 로컬 재현용. graph/*.jsonl이 정본이다.\n" + "\n".join(cypher) + "\n",
-    }
-
-
-def _store_zip(files: dict) -> str:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for name, content in files.items():
-            z.writestr(name, content)
-    tok = secrets.token_urlsafe(8)
-    _BUNDLES[tok] = buf.getvalue()
-    if len(_BUNDLES) > 200:
-        for k in list(_BUNDLES)[:100]:
-            _BUNDLES.pop(k, None)
-    return tok
 
 
 def _safe_filename(label: str) -> str:
@@ -578,7 +472,8 @@ def pack_qa(pack: str = DEFAULT_PACK) -> dict:
     """팩 전체를 그래머로 검사해 pass/fail과 위반 목록을 반환한다 (저장 전 필수 점검).
 
     검사 항목: 비선언 노드 타입, 정본 공간 오배치, 끊어진 엣지(끝점 부재),
-    엣지 공간 불일치, 비선언 관계, 고아 노드. pack_save가 이 리포트를 zip에 동봉한다.
+    엣지 공간 불일치, 비선언 관계, 고아 노드. pack_save 결과에는 qa_status·qa_issues
+    요약이 실리고 위반 시 qa_warning이 붙는다.
     """
     return _qa_scan(pack)
 
@@ -711,8 +606,8 @@ def authoring_register_candidate(space: str, node_type: str, node_id: str,
                                  pack: str = DEFAULT_PACK) -> dict:
     """저작 버퍼에 승격 후보(status=candidate)를 등록한다.
 
-    후보는 승격 전까지 완성 ZIP에 들어가지 않는다 (pack_save가 needs_promotion으로 막는다).
-    열린 완성 ZIP의 overlay 거버넌스(promotion_register_candidate)와 다른 경로다:
+    후보는 승격 전까지 완성 노트팩에 들어가지 않는다 (pack_save가 needs_promotion으로 막는다).
+    열린 완성 노트팩의 overlay 거버넌스(promotion_register_candidate)와 다른 경로다:
     이 도구는 저작 중인 draft 버퍼만 건드린다.
     """
     _ro = _read_only_block()
@@ -746,7 +641,7 @@ def authoring_promote(node_id: str, pack: str = DEFAULT_PACK,
     """후보를 승격(status=promoted)하고 Evidence를 근거 관계로 투영한다.
 
     evidence_ids는 evidence_refs에 기록되고, Claim에는 supports, Kinetic에는 records
-    엣지로 연결된다. 승격된 노드만 완성 ZIP에 들어간다.
+    엣지로 연결된다. 승격된 노드만 완성 노트팩에 들어간다.
     """
     _ro = _read_only_block()
     if _ro:
@@ -969,9 +864,67 @@ def pack_build_queryable(source_zip: str, out_zip: str | None = None,
     return local_pack.build_queryable(source_zip, out_zip, include_embeddings)
 
 
+def _pack_contract(nodes: dict, edges: list[dict]) -> dict:
+    """노트팩에 기록할 공간-타입·공간-관계-공간 계약을 만든다."""
+    node_types: dict[str, set[str]] = {}
+    for node in nodes.values():
+        space, node_type = node.get("space"), node.get("node_type")
+        if space and node_type:
+            node_types.setdefault(space, set()).add(node_type)
+    triples: dict[tuple[str, str, str], int] = {}
+    for edge in edges:
+        from_id = edge.get("from_id") or edge.get("source")
+        to_id = edge.get("to_id") or edge.get("target")
+        from_space = edge.get("from_space") or (nodes.get(from_id) or {}).get("space")
+        to_space = edge.get("to_space") or (nodes.get(to_id) or {}).get("space")
+        relation = edge.get("relation")
+        if from_space and relation and to_space:
+            key = (from_space, relation, to_space)
+            triples[key] = triples.get(key, 0) + 1
+    return {
+        "format": "yupack-pack-contract-v1",
+        "generated": datetime.date.today().isoformat(),
+        "node_types": {space: sorted(types) for space, types in sorted(node_types.items())},
+        "edge_triples": [[fs, rel, ts, count]
+                         for (fs, rel, ts), count in sorted(triples.items())],
+    }
+
+
 def _hydrate_from_zip(zip_path: str, pack: str | None = None) -> dict:
-    """저장된 팩 zip의 정본(nodes/edges + 커스텀 그래머)을 저작 버퍼(PACKS)로 복원한다."""
-    z = zipfile.ZipFile(os.path.expanduser(zip_path))
+    """저장된 zip 또는 note-pack 폴더를 정본(nodes/edges + 커스텀 그래머)에서 저작 버퍼로 복원한다."""
+    path = os.path.expanduser(zip_path)
+    if os.path.isdir(path):
+        from . import local_pack
+        lp = local_pack.LocalPack(path)
+        base = os.path.basename(os.path.normpath(path))
+        parent = os.path.basename(os.path.dirname(os.path.normpath(path)))
+        pack = pack or (parent if base == "note-pack" and parent else lp.pack_id)
+        buf = _get_pack(pack)
+        if buf["nodes"]:
+            return {"error": f"저작 버퍼 '{pack}'에 이미 노드 {len(buf['nodes'])}개가 있습니다. "
+                            "덮어쓰지 않습니다. pack 파라미터로 다른 이름을 지정하세요."}
+        for nid, node in lp.nodes.items():
+            buf["nodes"][nid] = {
+                "space": node.get("space"), "node_type": node.get("node_type"),
+                "properties": dict(node.get("properties") or {}),
+            }
+        for source, relations in lp.adj.items():
+            from_space = (lp.nodes.get(source) or {}).get("space")
+            for relation, target in relations:
+                if str(relation).startswith("~"):
+                    continue
+                to_space = (lp.nodes.get(target) or {}).get("space")
+                buf["edges"].append({"from_space": from_space, "from_id": source,
+                                     "relation": relation, "to_space": to_space,
+                                     "to_id": target, "properties": {}})
+        _persist(pack)
+        return {"authoring_pack": pack,
+                "counts": {"nodes": len(buf["nodes"]), "edges": len(buf["edges"])},
+                "custom_grammar": {"node_types": buf.get("custom_types", {}),
+                                    "relations": buf.get("custom_relations", [])},
+                "schema_packs": buf["schema_packs"]}
+
+    z = zipfile.ZipFile(path)
     names = set(z.namelist())
     meta: dict[str, str] = {}
     if "pack.yaml" in names:
@@ -980,7 +933,7 @@ def _hydrate_from_zip(zip_path: str, pack: str | None = None) -> dict:
                 k, v = ln.split(": ", 1)
                 meta[k.strip()] = v.strip()
     pack = pack or meta.get("title", "").strip('"') or \
-        os.path.splitext(os.path.basename(zip_path))[0]
+        os.path.splitext(os.path.basename(path))[0]
     buf = _get_pack(pack)
     if buf["nodes"]:
         return {"error": f"저작 버퍼 '{pack}'에 이미 노드 {len(buf['nodes'])}개가 있습니다. "
@@ -1111,7 +1064,7 @@ def _setup_gate() -> dict | None:
         return {
             "status": "needs_setup",
             "ask_user": ("유팩 첫 설정이 필요합니다. 아래 두 가지를 사용자에게 그대로 물어보세요. "
-                         "① 팩 zip을 보관할 폴더 (folder_candidates 중 선택 또는 직접 입력) "
+                         "① 팩(note-pack)을 보관할 서가 폴더 (folder_candidates 중 선택 또는 직접 입력) "
                          "② 임베딩 방식 (embed_options 중 선택 — 이 컴퓨터에서 지금 되는 것만 나열함)"),
             "folder_candidates": _discover_pack_dirs(),
             "embed_options": _embed_backend_options(),
@@ -1183,14 +1136,19 @@ def _zip_integrity_ok(path: str) -> bool:
 
 
 def _verified_final_pack_paths(directory: str) -> list[str]:
-    """경량 실험 ZIP이 아닌, 무결성 검증된 final ZIP만 최신순으로 돌려준다."""
+    """검증된 final ZIP과 MOC가 있는 note-pack 폴더를 수정시각 내림차순으로 돌려준다."""
     import glob as _glob
     paths = [
         path for path in _glob.glob(os.path.join(directory, "**", "*.zip"), recursive=True)
         if "_archive" not in path and os.path.isfile(path)
         and _is_final_pack_path(path) and _zip_integrity_ok(path)
     ]
-    return sorted(paths, key=os.path.getmtime, reverse=True)
+    paths += [
+        path for path in _glob.glob(os.path.join(directory, "**", "note-pack"), recursive=True)
+        if os.path.isdir(path)
+        and _glob.glob(os.path.join(path, "*-MOC.md"))
+    ]
+    return sorted(set(paths), key=lambda path: (os.path.getmtime(path), path), reverse=True)
 
 
 def _open_verified_final_library() -> dict:
@@ -1209,7 +1167,7 @@ def _open_verified_final_library() -> dict:
         return _AUTO_OPENED
     paths = _verified_final_pack_paths(candidates[0])
     if not paths:
-        _AUTO_OPENED = {"error": "무결성 검증을 통과한 final 팩이 없습니다.", "directory": candidates[0]}
+        _AUTO_OPENED = {"error": "검증된 final 팩이 없습니다.", "directory": candidates[0]}
         return _AUTO_OPENED
     if len(paths) > 1:
         choices = [{"title": os.path.basename(os.path.dirname(path)) or os.path.basename(path),
@@ -1281,14 +1239,15 @@ def _discover_pack_dirs() -> list[str]:
     for pat in seeds:
         for d in _glob.glob(pat):
             if os.path.isdir(d) and d not in found:
-                if _glob.glob(os.path.join(d, "**", "*.zip"), recursive=True):
+                if (_glob.glob(os.path.join(d, "**", "*.zip"), recursive=True)
+                        or _glob.glob(os.path.join(d, "**", "note-pack", "*-MOC.md"), recursive=True)):
                     found.append(d)
     return found
 
 
 @mcp.tool()
 def pack_list_local(directory: str = "") -> dict:
-    """팩 서랍을 스캔해 사용 가능한 팩 zip 목록을 반환한다 (최신순).
+    """팩 서랍을 스캔해 사용 가능한 zip·노트팩 목록을 반환한다 (최신순).
 
     directory 생략 시 YUPACK_PACK_DIR, 그것도 없으면 홈에서 자동 탐색한다.
     설정이 없어도 동작하며, 못 찾으면 사용자에게 물을 문구를 돌려준다.
@@ -1305,7 +1264,7 @@ def pack_list_local(directory: str = "") -> dict:
         cands = _discover_pack_dirs()
         if not cands:
             return {"packs": [], "searched": "홈 디렉토리 자동 탐색",
-                    "ask_user": "팩 zip이 들어 있는 폴더 경로를 알려주세요. "
+                    "ask_user": "팩이 들어 있는 폴더 경로를 알려주세요. "
                                 "(예: 옵시디언 볼트의 70_Ontology 폴더)",
                     "hint": "경로를 받으면 pack_list_local(directory=\"<경로>\")로 다시 부르세요."}
         if len(cands) > 1:
@@ -1315,26 +1274,32 @@ def pack_list_local(directory: str = "") -> dict:
         d = cands[0]
     if not os.path.isdir(d):
         return {"error": f"디렉토리가 없습니다: {d}", "packs": [],
-                "ask_user": "팩 zip이 들어 있는 폴더 경로를 알려주세요."}
+                "ask_user": "팩이 들어 있는 폴더 경로를 알려주세요."}
     packs = []
     for f in _glob.glob(os.path.join(d, "**", "*.zip"), recursive=True):
         if "_archive" in f or not os.path.isfile(f):
             continue
         st = os.stat(f)
-        packs.append({"path": f, "size_mb": round(st.st_size / 1e6, 1),
+        packs.append({"path": f, "type": "zip", "size_mb": round(st.st_size / 1e6, 1),
+                      "modified": datetime.datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")})
+    for f in _glob.glob(os.path.join(d, "**", "note-pack"), recursive=True):
+        if not os.path.isdir(f) or not _glob.glob(os.path.join(f, "*-MOC.md")):
+            continue
+        st = os.stat(f)
+        packs.append({"path": f, "type": "notepack",
                       "modified": datetime.datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")})
     packs.sort(key=lambda x: x["modified"], reverse=True)
     return {"directory": d, "count": len(packs), "packs": packs,
             "verified_final_packs": _verified_final_pack_paths(d),
-            "hint": "정본은 verified_final_packs에만 들어갑니다. 첫 pack_ask_local 질의는 이 라이브러리를 자동으로 엽니다."}
+            "hint": "정본은 verified_final_packs에만 들어갑니다(zip·note-pack). 첫 pack_ask_local 질의는 이 라이브러리를 자동으로 엽니다."}
 
 
 @mcp.tool()
 def pack_open_local(zip_path: str, mode: str = "read_only") -> dict:
-    """로컬 zip 팩을 열고 manifest.lock으로 무결성을 검증한다. pack_handle을 반환한다.
+    """로컬 zip 또는 note-pack 폴더를 열고 pack_handle을 반환한다.
 
     mode="read_only"(기본): 질의 전용 핸들만 연다.
-    mode="authoring": 핸들과 함께 zip의 정본을 저작 버퍼로 복원한다. 이후
+    mode="authoring": 핸들과 함께 팩의 정본을 저작 버퍼로 복원한다. 이후
       ontology_add_node/pack_qa/pack_save를 반환된 authoring_pack 이름으로 호출하면
       이어서 편집·검사·재저장할 수 있다. (핸들 id는 저작 버퍼가 아니다 - 혼용 금지)
     """
@@ -1346,7 +1311,7 @@ def pack_open_local(zip_path: str, mode: str = "read_only") -> dict:
         r = local_pack.open_local(zip_path, "read_only")
     except Exception as e:
         return {"error": f"열기 실패: {e}",
-                "hint": "경로가 바뀌었거나 zip이 아닐 수 있습니다. pack_list_local()로 현재 팩 목록을 확인하세요."}
+                "hint": "경로가 바뀌었거나 zip·note-pack 폴더가 아닐 수 있습니다. pack_list_local()로 현재 팩 목록을 확인하세요."}
     if mode == "authoring" and isinstance(r, dict) and "error" not in r:
         h = _hydrate_from_zip(zip_path)
         if "error" in h:
@@ -1417,16 +1382,16 @@ def pack_close(pack_handle: str) -> dict:
 def pack_set_default(zip_path: str) -> dict:
     """이 컴퓨터의 기본 팩을 지정한다.
 
-    사용자가 명시적으로 고른 zip 경로를 ~/.yupack/settings.json에만 저장한다. 플러그인 정의나
+    사용자가 명시적으로 고른 팩 경로(zip 또는 note-pack 폴더)를 ~/.yupack/settings.json에만 저장한다. 플러그인 정의나
     Codex 공용 config.toml은 수정하지 않는다. 이후 새 작업에서 이 팩만 자동으로 열 수 있다.
-    zip_path를 모르면 사용자에게 물어라 (사람마다 다르다).
+    경로를 모르면 사용자에게 물어라 (사람마다 다르다).
     """
     _ro = _read_only_block()
     if _ro:
         return _ro
     zip_path = os.path.expanduser(zip_path)
     if not os.path.exists(zip_path):
-        return {"error": f"팩 파일이 없습니다: {zip_path}. 저장한 팩 zip 경로를 확인하세요."}
+        return {"error": f"팩 경로가 없습니다: {zip_path}. 저장한 zip 또는 note-pack 경로를 확인하세요."}
     _save_default_pack_path(zip_path)
     return {"ok": True, "default_pack": zip_path,
             "settings": str(_settings_path()),
@@ -1531,7 +1496,7 @@ def pack_ingest_local_zip(zip_path: str, pack: str = DEFAULT_PACK,
 
     이 도구는 원문을 자동 요약·추출하지 않는다. 호출한 ChatGPT/Claude가
     pack_authoring_sources로 원문을 읽고 Claim·Concept·Kinetic·관계를 작성한다.
-    pack_authoring_complete 전에는 pack_save가 ZIP 생성을 거절한다.
+    pack_authoring_complete 전에는 pack_save가 노트팩 생성을 거절한다.
     """
     gate = _setup_gate()
     if gate:
@@ -1582,7 +1547,7 @@ def pack_ingest_local_zip(zip_path: str, pack: str = DEFAULT_PACK,
         "next": (
             "pack_authoring_sources(pack=..., cursor=0)로 원문을 읽고, 원문마다 "
             "ontology_add_node/ontology_add_edge로 구조화하세요. Claim 또는 Kinetic은 반드시 "
-            "Evidence와 연결하세요. 완료 뒤 pack_authoring_complete를 호출해야 ZIP을 저장할 수 있습니다."
+            "Evidence와 연결하세요. 완료 뒤 pack_authoring_complete를 호출해야 노트팩을 저장할 수 있습니다."
         ),
     }
 
@@ -1633,7 +1598,7 @@ def pack_authoring_sources(pack: str = DEFAULT_PACK, cursor: int = 0,
 
 
 def _promotion_gate(buf: dict, pack: str) -> dict | None:
-    """유크라테스 계약: 후보·검수 상태 노드는 완성 ZIP으로 나가지 못한다."""
+    """유크라테스 계약: 후보·검수 상태 노드는 완성 노트팩으로 나가지 못한다."""
     unpromoted = local_authoring.unpromoted_node_ids(buf)
     if not unpromoted:
         return None
@@ -1641,7 +1606,7 @@ def _promotion_gate(buf: dict, pack: str) -> dict | None:
         "status": "needs_promotion", "pack": pack, "unpromoted_node_ids": unpromoted,
         "next": ("authoring_promote(node_id=..., evidence_ids=[...])로 승격하거나 "
                  "authoring_reject로 정리한 뒤 다시 호출하세요. candidate·validated 상태 노드는 "
-                 "완성 ZIP에 포함되지 않습니다."),
+                 "완성 노트팩에 포함되지 않습니다."),
     }
 
 
@@ -1806,11 +1771,14 @@ def _quality_gate(buf: dict, pack: str) -> dict | None:
 
 
 def _heldout_verify(zip_path: str, buf: dict) -> dict:
-    """G6 본검사: 구운 zip을 그대로 다시 열어 검수 질문을 실측한다 ('구운 뒤 열어서 확인')."""
+    """G6 본검사: 만든 노트팩을 다시 열어 검수 질문을 실측한다 ('만든 뒤 열어서 확인')."""
     from . import local_pack
     checks = buf.get("quality_checks") or {}
     results, failures = [], []
     lp = local_pack.LocalPack(zip_path)
+    # 저장 게이트는 qmd를 관리하지 않는다. 질의 시점의 qmd 사용은 유지하되,
+    # 저장 중 held-out 검사는 lexical+graph만으로 수행한다.
+    lp.vector = lambda _question, _k=8: []
     for q in checks.get("questions") or []:
         st = lp.ask(q, 4).get("status")
         results.append({"question": q, "status": st})
@@ -1857,7 +1825,7 @@ def pack_register_checks(questions: list[str], pack: str = DEFAULT_PACK,
                          off_topic: str = "", work_type: str = "") -> dict:
     """저장 게이트 G6용 검수 질문을 등록한다 (5개 이상).
 
-    pack_save가 완성 zip을 직접 다시 열어 이 질문들이 전부 grounded인지, 팩 외부
+    pack_save가 완성 노트팩을 직접 다시 열어 이 질문들이 전부 grounded인지, 팩 외부
     대조 질문이 no_local_evidence로 거절되는지 실측한 뒤에만 저장한다.
     질문은 임의로 짓지 말고 원문·저작 내용에서 뽑아 사용자와 정한다.
     work_type: narrative(서사형) 또는 argument(논증형) — 품질 원장의 기준 프로파일 분기.
@@ -1877,29 +1845,6 @@ def pack_register_checks(questions: list[str], pack: str = DEFAULT_PACK,
     return {"ok": True, "pack": pack, "registered": len(qs[:12]),
             "off_topic": buf["quality_checks"]["off_topic"],
             "stores": {"buffer": "ok", "sqlite": _persist(pack)}}
-
-
-def _qmd_register_folder(folder: str, name: str) -> dict:
-    """노트팩 폴더를 qmd 컬렉션으로 등록한다 (임베딩은 qmd 소관 — 오너 결정 D2)."""
-    import shutil as _sh
-    import subprocess
-    from . import local_pack
-    if local_pack.EMBED_MODEL != "qmd":
-        return {"registered": False,
-                "reason": f"임베딩 모드가 qmd가 아님({local_pack.EMBED_MODEL}) — 어휘·그래프로 동작"}
-    if not _sh.which("qmd"):
-        return {"registered": False, "reason": "qmd 미설치"}
-    try:
-        r = subprocess.run(["qmd", "collection", "show", name],
-                           capture_output=True, text=True, timeout=30)
-        if r.returncode != 0 or name not in (r.stdout + r.stderr):
-            subprocess.run(["qmd", "collection", "add", folder, "--name", name],
-                           capture_output=True, text=True, timeout=60)
-        subprocess.run(["qmd", "update"], capture_output=True, text=True, timeout=300)
-        subprocess.run(["qmd", "embed", "-c", name], capture_output=True, text=True, timeout=600)
-        return {"registered": True, "collection": name}
-    except Exception as e:
-        return {"registered": False, "reason": str(e)[:120]}
 
 
 # 본문 섹션으로 렌더하는 필드 — frontmatter 스칼라 승격에서 제외
@@ -1947,7 +1892,8 @@ def _write_notepack(buf: dict, pack: str, note_dir: str, today: str) -> dict:
             aliases = [aliases]
         L = ["---", f'title: "{label(nid)}"', "tags:", f"  - 독서팩/{pack}",
              f"  - 프로젝트/{_safe_filename(pack)}-note-pack",
-             f"date: {today}", f"type: {n.get('node_type')}", f"node_id: {nid}"]
+             f"date: {today}", f"type: {n.get('node_type')}", f"space: {n.get('space')}",
+             f"node_id: {nid}"]
         if aliases:
             L.append("aliases:")
             L += [f"  - {a}" for a in aliases[:8]]
@@ -2035,7 +1981,7 @@ def _write_notepack(buf: dict, pack: str, note_dir: str, today: str) -> dict:
 
 def _save_notepack(buf: dict, pack: str, authoring_quality: dict,
                    save_to: str | None, overwrite: bool) -> dict:
-    """노트팩 저장: 게이트 통과한 버퍼 → 노트 폴더 + MOC + quality/ledger + qmd 등록.
+    """노트팩 저장: 게이트 통과한 버퍼 → 노트 폴더 + MOC + quality/ledger.
 
     G6는 만든 폴더를 노트팩 로더로 직접 다시 열어 실측한다 ('구운 뒤 열어서 확인').
     실패하면 방금 만든 산출물을 제거한다 — 반쪽 팩을 볼트에 남기지 않는다.
@@ -2073,13 +2019,14 @@ def _save_notepack(buf: dict, pack: str, authoring_quality: dict,
     os.makedirs(qdir, exist_ok=True)
     open(os.path.join(qdir, "ledger.json"), "w", encoding="utf-8").write(
         json.dumps(ledger, ensure_ascii=False, indent=2))
-    qmd_c = _qmd_register_folder(note_dir, f"{_safe_filename(pack)}-note-pack")
+    open(os.path.join(qdir, "pack-contract.json"), "w", encoding="utf-8").write(
+        json.dumps(_pack_contract(buf["nodes"], buf["edges"]),
+                   ensure_ascii=False, indent=2))
     result = {"format": "notepack", "saved_to": note_dir, "pack_folder": pack_root,
               "counts": {"nodes": len(buf["nodes"]), "edges": len(buf["edges"]),
                           "notes": written["count"]},
               "moc": written["moc"], "authoring_quality": authoring_quality,
               "qa_status": qa["status"], "qa_issues": qa["counts"]["issues"],
-              "qmd_collection": qmd_c,
               "quality": {"odyssey_class_score": ledger["odyssey_class_score"],
                           "gaps": ledger["gaps"],
                           "canonical_grade": ledger["canonical_grade"],
@@ -2126,12 +2073,15 @@ def pack_migrate_to_notes(zip_path: str, dest_dir: str = "", overwrite: bool = F
     today = datetime.date.today().isoformat()
     written = _write_notepack(buf_like, pack_name, note_dir, today)
     qdocs = lp._quality_docs()
+    qdir = os.path.join(note_dir, "quality")
+    os.makedirs(qdir, exist_ok=True)
     if qdocs:
-        qdir = os.path.join(note_dir, "quality")
-        os.makedirs(qdir, exist_ok=True)
         for rel, doc in qdocs.items():
             open(os.path.join(qdir, os.path.basename(rel)), "w", encoding="utf-8").write(
                 json.dumps(doc, ensure_ascii=False, indent=2))
+    open(os.path.join(qdir, "pack-contract.json"), "w", encoding="utf-8").write(
+        json.dumps(_pack_contract(buf_like["nodes"], buf_like["edges"]),
+                   ensure_ascii=False, indent=2))
     reopened = local_pack.LocalPack(note_dir)
     return {"format": "notepack", "migrated_from": zp, "saved_to": note_dir,
             "counts": {"zip_nodes": len(lp.nodes), "note_nodes": len(reopened.nodes),
@@ -2149,7 +2099,8 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
     산출: {서가}/{팩이름}/note-pack/ 폴더 — 타입별 노트(frontmatter 전 필드 +
     `동사:: [[대상]]` 관계) + {팩이름}-MOC.md 허브 + quality/ledger.json.
     저장 전 게이트(승격·커버리지·G1~G6)를 통과해야 하며, G6은 만든 폴더를 직접
-    다시 열어 검수 질문을 실측한다. 임베딩은 qmd 소관(컬렉션 자동 등록) —
+    다시 열어 검수 질문을 실측한다. 임베딩·색인은 qmd가 볼트 차원에서 자동 수행하며
+    유팩은 qmd를 조작하지 않는다 —
     include_embeddings 인자는 하위호환용으로 무시된다.
 
     save_to가 비어 있으면 설정 인터뷰의 팩 서가(pack_dir)를 쓰고, 그것도 없으면
@@ -2174,7 +2125,7 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
             "status": "needs_authoring_completion", "pack": pack,
             "source_ids": source_ids,
             "uncovered_source_ids": sorted(set(source_ids) - set(covered)),
-            "next": "호스트 저작을 마친 뒤 pack_authoring_complete(pack=...)를 호출하세요. 통과 전에는 ZIP을 저장하지 않습니다.",
+            "next": "호스트 저작을 마친 뒤 pack_authoring_complete(pack=...)를 호출하세요. 통과 전에는 노트팩을 저장하지 않습니다.",
         }
     authoring_quality = _authoring_quality(buf)
     if authoring_quality["status"] != "pass":
@@ -2183,130 +2134,8 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
     save_gate = _quality_gate(buf, pack)
     if save_gate:
         return save_gate
-    # zip 생산 폐기 — 저장은 노트팩 폴더 생성으로 대체됐다.
-    # 아래 구 zip 파이프라인은 도달 불가이며 P4 정리에서 제거한다.
+    # zip 생산 폐기(2026-08-13 오너 결정) — 저장은 노트팩 폴더 생성이다.
     return _save_notepack(buf, pack, authoring_quality, save_to, overwrite)
-    today = datetime.date.today().isoformat()
-
-    # 1) 버퍼 -> 정본 5파일 (evidence 노드는 evidence.jsonl로도 승격)
-    nodes_l, evidence_l = [], []
-    for nid, n in buf["nodes"].items():
-        props = n.get("properties", {})
-        nodes_l.append(json.dumps({"id": nid, "space": n["space"],
-                                    "node_type": n["node_type"], "label": props.get("label"),
-                                    "properties": props}, ensure_ascii=False))
-        if n["space"] == "evidence":
-            evidence_l.append(json.dumps({
-                "evidence_id": nid,
-                "summary": props.get("text") or props.get("definition") or props.get("label"),
-                "conditions": props.get("conditions"), "limitations": props.get("limitations"),
-                "evidence_grade": props.get("evidence_grade"),
-                "source_id": props.get("source_id"), "source_locator": props.get("source_locator"),
-            }, ensure_ascii=False))
-    edges_l = [json.dumps({"source": e["from_id"], "target": e["to_id"],
-                            "relation": e["relation"], "properties": e.get("properties", {})},
-                           ensure_ascii=False) for e in buf["edges"]]
-    pack_yaml = (f"schema: yucrates.ontology.v1.2\npack_id: {_safe_filename(pack)}-{today}\n"
-                 f"title: \"{pack}\"\nversion: 1.0.0\ncreated: {today}\n"
-                 f"manifest_version: \"{MANIFEST['version']}\"\n"
-                 f"schema_packs: {json.dumps(buf['schema_packs'], ensure_ascii=False)}\n"
-                 f"custom_node_types: {json.dumps(buf.get('custom_types', {}), ensure_ascii=False)}\n"
-                 f"custom_relations: {json.dumps(buf.get('custom_relations', []), ensure_ascii=False)}\n"
-                 f"storage: \"local zip only, production DB 미접촉\"\n")
-
-    with _tf.TemporaryDirectory() as td:
-        safe_pack = _safe_filename(pack)
-        src = os.path.join(td, f"{safe_pack}-canonical.zip")
-        with zipfile.ZipFile(src, "w", zipfile.ZIP_DEFLATED) as z:
-            z.writestr("pack.yaml", pack_yaml)
-            z.writestr("nodes.jsonl", "\n".join(nodes_l))
-            z.writestr("edges.jsonl", "\n".join(edges_l))
-            z.writestr("evidence.jsonl", "\n".join(evidence_l))
-            z.writestr("reviews.jsonl", "")
-        out = os.path.join(td, f"{safe_pack}-pack-final-{today}.zip")
-        # 2) 같은 표준 파이프라인으로 질의 가능 zip 생성
-        r = local_pack.build_queryable(src, out, include_embeddings)
-        if "error" in r:
-            return r
-        # 3) notes/ md 부속 + opencrab-pack-v1 계약 아티팩트 추가
-        qa = _qa_scan(pack)
-        contract = _contract_files(pack, buf, today, qa)
-        with zipfile.ZipFile(out, "a", zipfile.ZIP_DEFLATED) as z:
-            for name, content in contract.items():
-                z.writestr(name, content)
-            used_names: set[str] = set()
-            for nid, n in buf["nodes"].items():
-                props = n.get("properties", {})
-                label = props.get("label", nid)
-                base = _safe_filename(label)
-                fname = base
-                while fname in used_names:  # 동일 라벨 노드 md 덮어쓰기 방지
-                    fname = f"{base}-{hashlib.sha256(nid.encode()).hexdigest()[:6]}"
-                used_names.add(fname)
-                z.writestr(f"notes/{fname}.md",
-                           f"---\nid: {nid}\nspace: {n['space']}\ntype: {n['node_type']}\n---\n"
-                           f"# {label}\n\n{props.get('definition', props.get('text', ''))}\n")
-        # G6 본검사: 구운 zip을 직접 다시 열어 검수 질문·외부 거절을 실측한다
-        heldout = _heldout_verify(out, buf)
-        if heldout["failures"]:
-            return {"status": "needs_quality", "gate": "G6", "pack": pack,
-                    "heldout": heldout,
-                    "next": ("실패한 질문이 grounded가 되도록 근거·주장을 보강하거나, 검수 질문을 "
-                             "실제 저작 내용에 맞게 pack_register_checks로 다시 등록한 뒤 재시도하세요. "
-                             "저장되지 않았습니다.")}
-        m = _quality_measure(buf)
-        ledger = _quality_ledger(m, _work_type(buf, m), heldout)
-        with zipfile.ZipFile(out, "a", zipfile.ZIP_DEFLATED) as z:
-            z.writestr("quality/ledger.json", json.dumps(ledger, ensure_ascii=False, indent=2))
-        data = open(out, "rb").read()
-
-    result = {"structure": r["files"] if isinstance(r.get("files"), list) else None,
-              "counts": r["counts"], "embeddings": r["embeddings"],
-              "authoring_quality": authoring_quality,
-              "contract_files": list(contract.keys()),
-              "qa_status": qa["status"], "qa_issues": qa["counts"]["issues"],
-              "quality": {"odyssey_class_score": ledger["odyssey_class_score"],
-                          "gaps": ledger["gaps"],
-                          "canonical_grade": ledger["canonical_grade"],
-                          "work_type": ledger["work_type"],
-                          "heldout": f"{len(ledger['heldout']['results'])}문항 통과"}}
-    emb = r.get("embeddings") or {}
-    embedding_ready = (isinstance(emb, dict) and emb.get("count")) or \
-        (isinstance(emb, str) and emb.startswith(("qmd(", "included(")))
-    if not embedding_ready:
-        result["embedding_warning"] = ("임베딩 0개로 저장됐습니다. 한국어 등 의미(벡터) 질의가 "
-                                        "약해집니다. include_embeddings=true와 로컬 OMLX bge-m3 "
-                                        "실행 상태를 확인한 뒤 다시 저장하는 것을 권장합니다.")
-    if qa["status"] != "pass":
-        result["qa_warning"] = ("팩에 그래머 위반이 있습니다. quality/report.json 참조. "
-                                "pack_qa로 확인 후 수정하고 다시 저장하는 것을 권장합니다.")
-    is_server = bool(os.environ.get("RAILWAY_PUBLIC_DOMAIN"))
-    # 로컬 모드에서 저장 경로 미지정 -> 저장하지 않고 사용자에게 경로를 묻게 한다
-    destination = save_to or PACK_DESTINATIONS.get(pack)
-    if not destination and not is_server:
-        result["status"] = "needs_save_path"
-        result["ask_user"] = "압축파일(팩)을 어느 폴더에 저장할까요? 옵시디언 볼트의 팩 폴더 경로를 알려주세요."
-        return result
-    if is_server:
-        tok = secrets.token_urlsafe(8)
-        _BUNDLES[tok] = data
-        result["download_url"] = f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN']}/download/{tok}"
-        result["note"] = "서버 모드: 다운로드 후 로컬 팩 폴더로 옮기세요."
-        return result
-    # 로컬: 사용자가 준 경로 아래에 팩별 폴더를 유팩이 만들어 저장
-    base = os.path.expanduser(destination)
-    pack_dir = os.path.join(base, f"{_safe_filename(pack)}-{today}")
-    os.makedirs(pack_dir, exist_ok=True)
-    dest = os.path.join(pack_dir, f"{_safe_filename(pack)}-pack-final-{today}.zip")
-    with open(dest, "wb") as fh:
-        fh.write(data)
-    result["saved_to"] = dest
-    result["pack_folder"] = pack_dir
-    result["note"] = f"'{pack}' 팩을 저장했습니다: {dest}"
-    result["next_question"] = ("이 팩을 기본 팩으로 등록할까요? 등록하면 Codex를 켤 때마다 "
-                               "자동으로 열려 pack_open_local 없이 바로 질문할 수 있습니다. "
-                               f"등록하려면 pack_set_default(\"{dest}\")를 호출하세요.")
-    return result
 
 
 from . import governance as _governance
@@ -2430,13 +2259,6 @@ def build_app():
         from starlette.routing import Route
         from starlette.responses import Response
 
-        async def download(request):
-            data = _BUNDLES.get(request.path_params["token"])
-            if not data:
-                return Response("링크가 만료되었습니다. pack_save를 다시 호출하세요.", status_code=404)
-            return Response(data, media_type="application/zip",
-                            headers={"Content-Disposition": 'attachment; filename="yupack.zip"'})
-        app.router.routes.append(Route("/download/{token}", download))
 
         async def upload(request):
             data = await request.body()

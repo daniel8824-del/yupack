@@ -1,7 +1,8 @@
 """yupack 로컬 팩 엔진: self-contained ontology pack의 빌드·오픈·질의·거버넌스.
 
-설계 계약 (2026-07-23 Daniel 확정):
-- pack = zip 하나로 완결 (데이터 + 검수 + indexes/ + runtime/ + reports/)
+설계 계약 (2026-08-13 오너 확정):
+- pack = 옵시디언 노트팩 폴더로 완결
+- zip은 기존 팩 열기(소비)·pack_migrate_to_notes 이행 전용 하위호환
 - 원본은 read_only, 수정은 overlay + immutable audit event
 - cloud fallback 없음. 근거 없으면 no_local_evidence
 - 벡터 임베딩은 로컬 OMLX bge-m3(127.0.0.1:8000). 미가동 시 lexical+graph로 동작
@@ -535,6 +536,7 @@ class LocalPack:
     def __init__(self, zip_path: str, mode: str = "read_only"):
         self.zip_path = os.path.expanduser(zip_path)
         self.mode = mode
+        self.is_notepack = False
         if os.path.isdir(self.zip_path):
             # 노트팩(옵시디언 노트 폴더) — zip 생산 폐기 전환(2026-08-13 오너 결정)의 소비면
             self._init_notepack(self.zip_path)
@@ -664,6 +666,7 @@ class LocalPack:
         self.pack_id = f"{parent}-{base_name}" if base_name == "note-pack" and parent else base_name
         self.root = root
         self.cache = root
+        self.is_notepack = True
         self._no_audit = True
         notes = []
         h = hashlib.sha256()
@@ -699,10 +702,11 @@ class LocalPack:
                     kept.append(ln)
                 body_text = re.sub(r"^#+\s.*$", "", "\n".join(kept), flags=re.M).strip()
                 extras = {k: v for k, v in fm.items()
-                          if k not in ("title", "tags", "date", "type", "node_id", "aliases")
+                          if k not in ("title", "tags", "date", "type", "space", "node_id", "aliases")
                           and isinstance(v, str) and v}
                 notes.append({"id": nid, "label": fm.get("title") or os.path.splitext(f)[0],
-                              "type": fm.get("type"), "aliases": fm.get("aliases") or [],
+                              "type": fm.get("type"), "space": fm.get("space"),
+                              "aliases": fm.get("aliases") or [],
                               "extras": extras,
                               "body": body_text, "rels": rels, "locator": locator,
                               "orig": orig, "stem": os.path.splitext(f)[0]})
@@ -714,7 +718,7 @@ class LocalPack:
             stem2id.setdefault(n["label"], n["id"])
         self.nodes, self.evidence, self.adj = {}, {}, {}
         for n in notes:
-            space = self._NOTE_SPACE.get(n["type"], "concept")
+            space = n.get("space") or self._NOTE_SPACE.get(n["type"], "concept")
             props: dict = {"label": n["label"], "label_ko": n["label"]}
             # frontmatter의 나머지 스칼라(assertion_mode·confidence·story_order 등)를
             # 속성으로 왕복시킨다 — 노트가 전 필드 정본이 되는 조건
@@ -740,6 +744,37 @@ class LocalPack:
                     continue
                 self.adj.setdefault(n["id"], []).append([rel, tid])
                 self.adj.setdefault(tid, []).append(["~" + rel, n["id"]])
+        self.contract = {"present": False, "violations": 0}
+        contract_path = os.path.join(root, "quality", "pack-contract.json")
+        if os.path.isfile(contract_path):
+            self.contract["present"] = True
+            try:
+                declared = json.load(open(contract_path, encoding="utf-8"))
+                expected: dict[tuple[str, str, str], int] = {}
+                for item in declared.get("edge_triples", []):
+                    if not isinstance(item, list) or len(item) != 4:
+                        self.contract["violations"] += 1
+                        continue
+                    key = tuple(item[:3])
+                    expected[key] = expected.get(key, 0) + int(item[3])
+                actual: dict[tuple[str, str, str], int] = {}
+                for source, relations in self.adj.items():
+                    from_space = (self.nodes.get(source) or {}).get("space")
+                    for relation, target in relations:
+                        if str(relation).startswith("~"):
+                            continue
+                        to_space = (self.nodes.get(target) or {}).get("space")
+                        if not from_space or not to_space:
+                            self.contract["violations"] += 1
+                            continue
+                        key = (from_space, relation, to_space)
+                        actual[key] = actual.get(key, 0) + 1
+                self.contract["violations"] += sum(
+                    abs(actual.get(key, 0) - expected.get(key, 0))
+                    for key in set(actual) | set(expected)
+                )
+            except (OSError, ValueError, TypeError):
+                self.contract["violations"] += 1
         self.reviews = {}
         self.vec_meta, self.vecs = [], b""
         self.embed_model, self.dim = EMBED_MODEL, EMBED_DIM
@@ -789,12 +824,15 @@ class LocalPack:
             pass
 
     def status(self) -> dict:
-        return {"pack_id": self.pack_id, "manifest_hash": self.manifest_hash,
+        status = {"pack_id": self.pack_id, "manifest_hash": self.manifest_hash,
                 "mode": self.mode, "integrity": self.integrity,
                 "baseline_compliance": self._baseline_summary(),
                 "counts": {"nodes": len(self.nodes), "evidence": len(self.evidence),
                             "reviews": sum(len(v) for v in self.reviews.values()),
                             "vectors": len(self.vec_meta), "adjacency": len(self.adj)}}
+        if self.is_notepack:
+            status["contract"] = self.contract
+        return status
 
     # --- 품질층 (T2 노출 · T3 재계산 대조) ---
     def _quality_docs(self) -> dict[str, dict]:
