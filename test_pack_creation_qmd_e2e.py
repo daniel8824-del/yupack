@@ -63,6 +63,8 @@ def test_full_pack_creation_with_qmd_embeddings(monkeypatch):
             assert promoted["lifecycle_status"] == "promoted"
             done = S.pack_authoring_complete(pack)
             assert done["status"] == "ready_to_save", done
+            from quality_fixture import fill_quality_floor
+            fill_quality_floor(S, pack)
 
             # ④ 저장 (임베딩 포함 요청 — qmd 모드는 런타임 컬렉션 계약)
             saved = S.pack_save(pack, include_embeddings=True)

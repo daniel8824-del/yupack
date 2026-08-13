@@ -216,6 +216,8 @@ class PromotionLifecycleTest(_PackTestCase):
 
         promoted = server.authoring_promote("claim:identity-cost", pack="승격팩",
                                             evidence_ids=[source_id])
+        from quality_fixture import fill_quality_floor
+        fill_quality_floor(server, "승격팩")
         saved = server.pack_save("승격팩", include_embeddings=False)
 
         self.assertEqual("promoted", promoted["lifecycle_status"])
@@ -248,6 +250,8 @@ class PromotionLifecycleTest(_PackTestCase):
              "statement": "역사가가 무엇을 기록할지 고르므로 남은 사실은 해석을 거친다."},
             source_id=source_id, pack="논증팩")
         server.authoring_promote("claim:selection", pack="논증팩", evidence_ids=[source_id])
+        from quality_fixture import fill_quality_floor
+        fill_quality_floor(server, "논증팩")
 
         quality = server.pack_quality("논증팩")
         saved = server.pack_save("논증팩", include_embeddings=False)
@@ -279,6 +283,8 @@ class PromotionLifecycleTest(_PackTestCase):
             "claim", "Claim", "claim:first", {"label": "첫 주장"},
             source_id=source_id, pack="불변팩")
         server.authoring_promote("claim:first", pack="불변팩", evidence_ids=[source_id])
+        from quality_fixture import fill_quality_floor
+        fill_quality_floor(server, "불변팩")
         saved = server.pack_save("불변팩", include_embeddings=False)
         before = hashlib.sha256(open(saved["saved_to"], "rb").read()).hexdigest()
 

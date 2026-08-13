@@ -48,10 +48,12 @@ def test_pack_ask_chain():
 
 
 def test_pack_save_zip():
+    from quality_fixture import fill_quality_floor
+    fill_quality_floor(S, S.DEFAULT_PACK)
     r = S.pack_save()
     # 기본 로컬 임베딩은 bge-m3다. OMLX가 꺼진 환경에서는 skipped도 정상 폴백이다.
     assert r["embeddings"].startswith(("included(", "skipped")), r["embeddings"]
-    assert r["counts"]["nodes"] == 2
+    assert r["counts"]["nodes"] == len(S.PACKS[S.DEFAULT_PACK]["nodes"])
     # pack_save는 더 이상 download_url/_BUNDLES 번들을 만들지 않는다. 저장 경로를
     # 사용자에게 묻고(ask_user) 구울 구조를 structure로 돌려준다.
     # 계약 12항목이 실제로 생성되는지를 확인하는 편이 번들 검사보다 값어치가 있다.

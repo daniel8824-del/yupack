@@ -7,6 +7,7 @@ from pathlib import Path
 os.environ.pop("OPENAI_API_KEY", None)
 
 import yupack_mcp.server as S  # noqa: E402
+from quality_fixture import fill_quality_floor  # noqa: E402
 from yupack_mcp.local_pack import LocalPack  # noqa: E402
 
 
@@ -43,6 +44,7 @@ def test_no_key_authoring_saves_final_zip_and_reopens_queryable():
                                         "text": "기억은 이야기를 보존한다."}, pack="무키생성")
         S.authoring_validate_candidate("claim:memory", pack="무키생성")
         S.authoring_promote("claim:memory", pack="무키생성", evidence_ids=["ev:memory"])
+        fill_quality_floor(S, "무키생성")
         saved = S.pack_save("무키생성", include_embeddings=False)
         path = Path(saved["saved_to"])
         assert path.name.startswith("무키생성-pack-final-")
@@ -69,6 +71,7 @@ def test_default_pack_is_user_local_preference_not_codex_config():
                                             "text": "기본 팩의 근거다."}, pack="기본팩")
             S.authoring_validate_candidate("claim:default", pack="기본팩")
             S.authoring_promote("claim:default", pack="기본팩", evidence_ids=["ev:default"])
+            fill_quality_floor(S, "기본팩")
             saved = S.pack_save("기본팩", include_embeddings=False)
             chosen = S.pack_set_default(saved["saved_to"])
             assert chosen["ok"]

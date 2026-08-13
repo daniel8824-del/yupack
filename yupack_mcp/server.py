@@ -1705,10 +1705,163 @@ def _authoring_quality(buf: dict) -> dict:
                      if answer_bearing else "근거 Evidence만 있거나 Concept 이름만 있습니다. Claim 또는 Kinetic이 없는 이 상태는 경량 초안이며 완성 팩으로 저장할 수 없습니다.")}
 
 
+# ── 품질 게이트 (2026-08-13 오너 승인 · design-2026-08-13-user-pack-quality-gate) ──
+# 11개 정본 팩 전수 실측에서 나온 불변식만 저장을 차단한다. 기준 프로파일은
+# 오디세이(서사형)·역사란 무엇인가(논증형) 실측치. 오디세이급 점수는 차단이 아니라
+# quality/ledger.json에 기록되는 관측값이다 — 필수만 막고 나머지는 보이는 공백으로.
+QUALITY_FLOOR = {"claim": 5, "theme": 3, "evidence": 20, "checks": 5}
+NARRATIVE_PROFILE = {"evidence": 239, "claim": 14, "theme": 46, "kinetic": 223,
+                     "causal_edges": 21, "aliases_ratio": 0.53}
+ARGUMENT_PROFILE = {"evidence": 48, "claim": 96, "theme": 16, "aliases_ratio": 0.21}
+DEFAULT_OFF_TOPIC = "비트코인 반감기는 언제이고 가격에 어떤 영향을 주는가?"
+_THEME_TYPES = {"Theme", "Topic"}  # Topic이 그래머 정본, Theme은 정본 팩들의 커스텀 선언
+
+
+def _quality_measure(buf: dict) -> dict:
+    from .local_pack import CAUSAL_RELS
+    nodes, edges = buf["nodes"], buf["edges"]
+    sup_to = {e.get("to_id") for e in edges if e.get("relation") == "supports"}
+    claims = [nid for nid, n in nodes.items() if n.get("space") == "claim"]
+    claims_linked = [nid for nid in claims
+                     if (nodes[nid].get("properties") or {}).get("evidence_refs") or nid in sup_to]
+    themes = [nid for nid, n in nodes.items() if n.get("node_type") in _THEME_TYPES]
+    themes_linked = [nid for nid in themes
+                     if (nodes[nid].get("properties") or {}).get("evidence_refs") or nid in sup_to]
+    evid = [nid for nid, n in nodes.items() if n.get("space") == "evidence"]
+    loc_missing, loc_invalid = [], []
+    for nid in evid:
+        p = nodes[nid].get("properties") or {}
+        loc = p.get("source_locator") or p.get("locator")
+        if not loc:
+            loc_missing.append(nid)
+        elif isinstance(loc, dict):
+            a, b = loc.get("start_line"), loc.get("end_line")
+            if a is not None and b is not None and \
+                    (not isinstance(a, int) or not isinstance(b, int) or a < 1 or b < a):
+                loc_invalid.append(nid)
+    concepts = [n for n in nodes.values() if n.get("space") == "concept"]
+    alias = sum(1 for n in concepts if (n.get("properties") or {}).get("aliases_ko"))
+    return {"claims": len(claims), "claims_linked": len(claims_linked),
+            "claims_unlinked": sorted(set(claims) - set(claims_linked)),
+            "themes": len(themes), "themes_linked": len(themes_linked),
+            "evidence": len(evid),
+            "locator_missing_count": len(loc_missing), "locator_missing": loc_missing[:8],
+            "locator_invalid": loc_invalid[:8],
+            "concepts": len(concepts),
+            "aliases_ratio": round(alias / len(concepts), 2) if concepts else 0.0,
+            "kinetic": sum(1 for n in nodes.values() if n.get("space") == "kinetic"),
+            "causal_edges": sum(1 for e in edges if e.get("relation") in CAUSAL_RELS),
+            "edges": len(edges)}
+
+
+def _work_type(buf: dict, m: dict) -> str:
+    declared = (buf.get("quality_checks") or {}).get("work_type")
+    if declared:
+        return declared
+    return "argument" if m["kinetic"] == 0 else "narrative"
+
+
+def _quality_gate(buf: dict, pack: str) -> dict | None:
+    """저장 차단 게이트 G1·G2·G4·G5 + G6 사전조건(검수 질문 등록). 통과 시 None."""
+    m = _quality_measure(buf)
+    gates = []
+    if m["claims"] < QUALITY_FLOOR["claim"] or m["claims_unlinked"]:
+        gates.append({"gate": "G1", "need": f"Claim ≥ {QUALITY_FLOOR['claim']} + 전부 근거 연결",
+                      "now": f"claims {m['claims']}, 미연결 {len(m['claims_unlinked'])}"})
+    if m["locator_missing_count"] or m["locator_invalid"]:
+        gates.append({"gate": "G2", "need": "모든 Evidence에 locator + 범위 정합",
+                      "now": f"누락 {m['locator_missing_count']}, 불량 {len(m['locator_invalid'])}",
+                      "sample": (m["locator_missing"] + m["locator_invalid"])[:4]})
+    if m["themes"] < QUALITY_FLOOR["theme"] or m["themes_linked"] < m["themes"]:
+        gates.append({"gate": "G4", "need": f"주제(Topic/Theme) ≥ {QUALITY_FLOOR['theme']} + 근거 연결",
+                      "now": f"themes {m['themes']}, 연결 {m['themes_linked']}"})
+    if m["evidence"] < QUALITY_FLOOR["evidence"]:
+        gates.append({"gate": "G5", "need": f"Evidence ≥ {QUALITY_FLOOR['evidence']} (원문 조각화)",
+                      "now": f"evidence {m['evidence']}"})
+    checks = (buf.get("quality_checks") or {}).get("questions") or []
+    if len(checks) < QUALITY_FLOOR["checks"]:
+        gates.append({"gate": "G6", "need": f"검수 질문 ≥ {QUALITY_FLOOR['checks']} 등록",
+                      "now": f"{len(checks)}개",
+                      "hint": "pack_register_checks(questions=[...])로 원문·저작 내용 기반 질문을 등록하세요."})
+    if not gates:
+        return None
+    return {"status": "needs_quality", "pack": pack, "gates": gates, "measure": m,
+            "next": ("11개 정본 팩 전수 실측 불변식입니다. 부족한 축을 저작으로 채운 뒤 "
+                     "다시 pack_save를 호출하세요. 이 게이트 밑으로는 완성 팩을 저장하지 않습니다.")}
+
+
+def _heldout_verify(zip_path: str, buf: dict) -> dict:
+    """G6 본검사: 구운 zip을 그대로 다시 열어 검수 질문을 실측한다 ('구운 뒤 열어서 확인')."""
+    from . import local_pack
+    checks = buf.get("quality_checks") or {}
+    results, failures = [], []
+    lp = local_pack.LocalPack(zip_path)
+    for q in checks.get("questions") or []:
+        st = lp.ask(q, 4).get("status")
+        results.append({"question": q, "status": st})
+        if st != "grounded":
+            failures.append(q)
+    off = checks.get("off_topic") or DEFAULT_OFF_TOPIC
+    off_st = lp.ask(off, 4).get("status")
+    results.append({"question": off, "status": off_st, "expect": "no_local_evidence"})
+    if off_st != "no_local_evidence":
+        failures.append(f"[팩 외부 질문이 거절되지 않음] {off}")
+    return {"results": results, "failures": failures}
+
+
+def _quality_ledger(m: dict, work_type: str, heldout: dict) -> dict:
+    profile = ARGUMENT_PROFILE if work_type == "argument" else NARRATIVE_PROFILE
+    mkey = {"evidence": "evidence", "claim": "claims", "theme": "themes",
+            "kinetic": "kinetic", "causal_edges": "causal_edges", "aliases_ratio": "aliases_ratio"}
+    axes = {k: round(min(1.0, (m[mkey[k]] / ref) if ref else 1.0), 2)
+            for k, ref in profile.items()}
+    score = round(100 * sum(axes.values()) / len(axes))
+    gaps = sorted(k for k, v in axes.items() if v < 0.5)
+    return {"schema": "yupack.quality-ledger/v1",
+            "reference_profile": "what-is-history-carr" if work_type == "argument" else "odyssey-butler",
+            "work_type": work_type, "measure": m, "axes": axes,
+            "odyssey_class_score": score, "gaps": gaps,
+            # 정본 서가 등재·수업 배포 기준 (오너 재조정 가능): 총점 80 + 50% 미만 축 없음
+            "canonical_grade": bool(score >= 80 and not gaps),
+            "heldout": heldout, "source_revision": SOURCE_REVISION}
+
+
 @mcp.tool()
 def pack_quality(pack: str = DEFAULT_PACK) -> dict:
-    """저장 전 저작 품질을 확인한다. Evidence-only 경량 팩은 needs_authoring으로 표시한다."""
-    return _authoring_quality(_get_pack(pack))
+    """저장 전 저작 품질을 확인한다. Evidence-only 경량 팩은 needs_authoring으로 표시하고,
+    저장 게이트(G1~G6) 판정과 오디세이 프로파일 실측치를 함께 돌려준다."""
+    buf = _get_pack(pack)
+    base = _authoring_quality(buf)
+    m = _quality_measure(buf)
+    return {**base, "quality_measure": m, "work_type": _work_type(buf, m),
+            "save_gate": _quality_gate(buf, pack) or {"status": "pass"}}
+
+
+@mcp.tool()
+def pack_register_checks(questions: list[str], pack: str = DEFAULT_PACK,
+                         off_topic: str = "", work_type: str = "") -> dict:
+    """저장 게이트 G6용 검수 질문을 등록한다 (5개 이상).
+
+    pack_save가 완성 zip을 직접 다시 열어 이 질문들이 전부 grounded인지, 팩 외부
+    대조 질문이 no_local_evidence로 거절되는지 실측한 뒤에만 저장한다.
+    질문은 임의로 짓지 말고 원문·저작 내용에서 뽑아 사용자와 정한다.
+    work_type: narrative(서사형) 또는 argument(논증형) — 품질 원장의 기준 프로파일 분기.
+    """
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
+    qs = [q.strip() for q in (questions or []) if isinstance(q, str) and q.strip()]
+    if len(qs) < QUALITY_FLOOR["checks"]:
+        return {"error": f"검수 질문이 부족합니다: {len(qs)}개 (최소 {QUALITY_FLOOR['checks']}개)"}
+    if work_type and work_type not in {"narrative", "argument"}:
+        return {"error": "work_type은 narrative 또는 argument만 됩니다."}
+    buf = _get_pack(pack)
+    buf["quality_checks"] = {"questions": qs[:12],
+                            "off_topic": off_topic.strip() or DEFAULT_OFF_TOPIC,
+                            "work_type": work_type or None}
+    return {"ok": True, "pack": pack, "registered": len(qs[:12]),
+            "off_topic": buf["quality_checks"]["off_topic"],
+            "stores": {"buffer": "ok", "sqlite": _persist(pack)}}
 
 
 @mcp.tool()
@@ -1751,6 +1904,9 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
     if authoring_quality["status"] != "pass":
         return {"status": "needs_authoring", "quality": authoring_quality,
                 "next": "원문을 구조화해 Claim 또는 Kinetic을 근거와 연결한 뒤 다시 pack_save를 호출하세요. Evidence-only 팩은 저장하지 않습니다."}
+    save_gate = _quality_gate(buf, pack)
+    if save_gate:
+        return save_gate
     today = datetime.date.today().isoformat()
 
     # 1) 버퍼 -> 정본 5파일 (evidence 노드는 evidence.jsonl로도 승격)
@@ -1811,13 +1967,30 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
                 z.writestr(f"notes/{fname}.md",
                            f"---\nid: {nid}\nspace: {n['space']}\ntype: {n['node_type']}\n---\n"
                            f"# {label}\n\n{props.get('definition', props.get('text', ''))}\n")
+        # G6 본검사: 구운 zip을 직접 다시 열어 검수 질문·외부 거절을 실측한다
+        heldout = _heldout_verify(out, buf)
+        if heldout["failures"]:
+            return {"status": "needs_quality", "gate": "G6", "pack": pack,
+                    "heldout": heldout,
+                    "next": ("실패한 질문이 grounded가 되도록 근거·주장을 보강하거나, 검수 질문을 "
+                             "실제 저작 내용에 맞게 pack_register_checks로 다시 등록한 뒤 재시도하세요. "
+                             "저장되지 않았습니다.")}
+        m = _quality_measure(buf)
+        ledger = _quality_ledger(m, _work_type(buf, m), heldout)
+        with zipfile.ZipFile(out, "a", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("quality/ledger.json", json.dumps(ledger, ensure_ascii=False, indent=2))
         data = open(out, "rb").read()
 
     result = {"structure": r["files"] if isinstance(r.get("files"), list) else None,
               "counts": r["counts"], "embeddings": r["embeddings"],
               "authoring_quality": authoring_quality,
               "contract_files": list(contract.keys()),
-              "qa_status": qa["status"], "qa_issues": qa["counts"]["issues"]}
+              "qa_status": qa["status"], "qa_issues": qa["counts"]["issues"],
+              "quality": {"odyssey_class_score": ledger["odyssey_class_score"],
+                          "gaps": ledger["gaps"],
+                          "canonical_grade": ledger["canonical_grade"],
+                          "work_type": ledger["work_type"],
+                          "heldout": f"{len(ledger['heldout']['results'])}문항 통과"}}
     emb = r.get("embeddings") or {}
     embedding_ready = (isinstance(emb, dict) and emb.get("count")) or \
         (isinstance(emb, str) and emb.startswith(("qmd(", "included(")))

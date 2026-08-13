@@ -12,6 +12,10 @@ from pathlib import Path
 
 import pytest
 
+# bge-m3 sidecar 캐시가 테스트 산출물로 사용자 캐시(~/.cache/yupack)를 오염시키지 않게
+# 격리한다. local_pack이 import 시점에 읽으므로 conftest 모듈 로드 시점에 설정한다.
+os.environ.setdefault("YUPACK_BGE_CACHE_DIR", tempfile.mkdtemp(prefix="yupack-test-bge-"))
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _configured_yupack_settings():
