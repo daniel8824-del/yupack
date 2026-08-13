@@ -20,6 +20,9 @@ from urllib.parse import quote
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
+from . import local_authoring
+from . import yucrates_contract
+
 # 클라이언트 모델이 "로컬 파일을 다뤄도 되나"를 추측하지 않도록 서버 성격을
 # initialize 단계에서 사실대로 알려준다. 없으면 모르는 쪽으로 기울어 오거절한다.
 _INSTRUCTIONS = """yupack은 사용자 본인의 컴퓨터에서 도는 완전 로컬 MCP 서버입니다.
@@ -164,39 +167,20 @@ def _read_only_block() -> dict | None:
     return None
 
 
+# 그래머 판정의 정본은 yucrates_contract(유크라테스 이식본) 하나다. 아래는 그 얇은 호출부.
 def _space_of(node_type: str) -> str | None:
-    for space, info in MANIFEST["spaces"].items():
-        if node_type in info["node_types"]:
-            return space
-    return None
-
-
-def _allowed_relations(from_space: str | None, to_space: str | None) -> list[str] | None:
-    if not from_space or not to_space:
-        return None
-    for me in MANIFEST["meta_edges"]:
-        if me["from_space"] == from_space and me["to_space"] == to_space:
-            return me["relations"]
-    return None
+    return yucrates_contract.space_for_node_type(node_type)
 
 
 def _allowed_types_for(buf: dict, space: str) -> list[str]:
     """공간별 허용 노드 타입 = 기본 그래머 + 설치 스키마팩(공간 자유) + 팩 커스텀 선언."""
-    types = list(MANIFEST["spaces"].get(space, {}).get("node_types", []))
-    types += buf.get("custom_types", {}).get(space, [])
-    for sp in buf.get("schema_packs", []):
-        types += MANIFEST["schema_packs"].get(sp, [])
-    return types
+    return yucrates_contract.allowed_node_types(space, local_authoring._extra_types(buf))
 
 
 def _edge_relations(buf: dict, from_space: str, to_space: str) -> list[str] | None:
     """공간 쌍의 허용 관계(기본 meta_edges + 팩 커스텀 선언). 쌍 자체가 미선언이면 None."""
-    rels, declared = [], False
-    for me in MANIFEST["meta_edges"] + buf.get("custom_relations", []):
-        if me["from_space"] == from_space and me["to_space"] == to_space:
-            rels += me["relations"]
-            declared = True
-    return rels if declared else None
+    return yucrates_contract.get_allowed_relations(from_space, to_space,
+                                                   local_authoring._extra_relations(buf))
 
 
 def _qa_scan(pack: str) -> dict:
@@ -676,26 +660,10 @@ def ontology_add_node(space: str, node_type: str, node_id: str,
     _ro = _read_only_block()
     if _ro:
         return _ro
-    if space not in MANIFEST["spaces"]:
-        return {"error": f"알 수 없는 space: {space}. 사용 가능: {list(MANIFEST['spaces'])}"}
-    buf = _get_pack(pack)
-    canonical = _space_of(node_type)
-    if canonical and canonical != space:
-        return {"error": f"'{node_type}'의 정본 공간은 '{canonical}'입니다. space='{canonical}'로 추가하세요.",
-                "hint": f"예: Claim은 claim 공간, TextUnit은 evidence 공간 소속입니다."}
-    if node_type not in _allowed_types_for(buf, space):
-        return {"error": f"'{space}' 공간에 선언되지 않은 노드 타입: {node_type}",
-                "declared_types": MANIFEST["spaces"][space]["node_types"],
-                "custom_types": buf.get("custom_types", {}).get(space, []),
-                "hint": "커스텀 타입은 schema_declare(node_types={\"" + space + "\": [\"" + node_type + "\"]})로 "
-                        "먼저 선언한 뒤 추가하세요. 도메인 묶음은 schema_pack_install 참고."}
-    existing = buf["nodes"].get(node_id)
-    if existing and (existing["space"] != space or existing["node_type"] != node_type):
-        return {"error": f"id 충돌: '{node_id}'는 이미 {existing['space']}/{existing['node_type']} 노드입니다. "
-                          "기존 노드를 덮어쓰지 않습니다. 다른 id를 사용하세요."}
-    node_data = {"space": space, "node_type": node_type, "properties": properties or {}}
-    buf["nodes"][node_id] = node_data
-    return {"stores": {"buffer": "ok", "sqlite": _persist(pack)}, "node_data": {node_id: node_data}}
+    try:
+        return local_authoring.builder_for(pack).add_node(space, node_type, node_id, properties)
+    except local_authoring.AuthoringError as exc:
+        return {"error": str(exc), **exc.details}
 
 
 @mcp.tool()
@@ -705,35 +673,84 @@ def ontology_add_edge(from_space: str, from_id: str, relation: str, to_space: st
     """엣지 하나를 팩 버퍼에 추가한다. 그래머(끝점 실존·실제 공간·허용 관계)를 강제한다.
 
     끝점 노드가 팩에 먼저 있어야 하고, 선언된 공간 쌍·관계만 허용된다.
+    같은 (from, relation, to)를 다시 넣으면 쌓지 않고 속성만 갱신한다(created=false).
     새 관계가 필요하면 schema_declare(relations=[...])로 먼저 선언한다.
     """
     _ro = _read_only_block()
     if _ro:
         return _ro
-    buf = _get_pack(pack)
-    for side, sid, sspace in (("from", from_id, from_space), ("to", to_id, to_space)):
-        n = buf["nodes"].get(sid)
-        if not n:
-            return {"error": f"{side} 노드가 팩에 없습니다: '{sid}'. ontology_add_node로 먼저 추가하세요."}
-        if n["space"] != sspace:
-            return {"error": f"{side} 노드 '{sid}'의 실제 공간은 '{n['space']}'입니다 ('{sspace}' 아님). "
-                              f"{side}_space='{n['space']}'로 다시 시도하세요."}
-    allowed = _edge_relations(buf, from_space, to_space)
-    if allowed is None:
-        pairs = sorted({(me["from_space"], me["to_space"])
-                        for me in MANIFEST["meta_edges"] + buf.get("custom_relations", [])
-                        if me["from_space"] == from_space})
-        return {"error": f"'{from_space}'→'{to_space}' 공간 쌍에 선언된 관계가 없습니다.",
-                "declared_pairs_from_here": [f"{a}→{b}" for a, b in pairs],
-                "hint": "schema_declare(relations=[{\"from_space\": \"" + from_space + "\", \"to_space\": \""
-                        + to_space + "\", \"relations\": [\"" + relation + "\"]}])로 먼저 선언하세요."}
-    if relation not in allowed:
-        return {"error": f"'{from_space}'→'{to_space}' 간 허용되지 않은 관계: {relation}. "
-                          f"허용된 관계: {allowed}"}
-    edge = {"from_space": from_space, "from_id": from_id, "relation": relation,
-            "to_space": to_space, "to_id": to_id, "properties": properties or {}}
-    buf["edges"].append(edge)
-    return {"stores": {"buffer": "ok", "sqlite": _persist(pack)}, "edge": edge}
+    try:
+        return local_authoring.builder_for(pack).add_edge(
+            from_space, from_id, relation, to_space, to_id, properties)
+    except local_authoring.AuthoringError as exc:
+        return {"error": str(exc), **exc.details}
+
+
+@mcp.tool()
+def authoring_register_candidate(space: str, node_type: str, node_id: str,
+                                 properties: dict | None = None,
+                                 confidence: float | None = None,
+                                 source_id: str | None = None,
+                                 pack: str = DEFAULT_PACK) -> dict:
+    """저작 버퍼에 승격 후보(status=candidate)를 등록한다.
+
+    후보는 승격 전까지 완성 ZIP에 들어가지 않는다 (pack_save가 needs_promotion으로 막는다).
+    열린 완성 ZIP의 overlay 거버넌스(promotion_register_candidate)와 다른 경로다:
+    이 도구는 저작 중인 draft 버퍼만 건드린다.
+    """
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
+    try:
+        return local_authoring.engine_for(pack).register_candidate(
+            space, node_type, node_id, properties, confidence, source_id)
+    except local_authoring.AuthoringError as exc:
+        return {"error": str(exc), **exc.details}
+
+
+@mcp.tool()
+def authoring_validate_candidate(node_id: str, pack: str = DEFAULT_PACK,
+                                 validator_id: str | None = None,
+                                 note: str | None = None) -> dict:
+    """후보를 검수 완료(status=validated)로 표시한다. 아직 저장 가능은 아니다."""
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
+    try:
+        return local_authoring.engine_for(pack).validate_candidate(node_id, validator_id, note)
+    except local_authoring.AuthoringError as exc:
+        return {"error": str(exc), **exc.details}
+
+
+@mcp.tool()
+def authoring_promote(node_id: str, pack: str = DEFAULT_PACK,
+                      promoted_by: str | None = None,
+                      evidence_ids: list[str] | None = None) -> dict:
+    """후보를 승격(status=promoted)하고 Evidence를 근거 관계로 투영한다.
+
+    evidence_ids는 evidence_refs에 기록되고, Claim에는 supports, Kinetic에는 records
+    엣지로 연결된다. 승격된 노드만 완성 ZIP에 들어간다.
+    """
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
+    try:
+        return local_authoring.engine_for(pack).promote(node_id, promoted_by, evidence_ids)
+    except local_authoring.AuthoringError as exc:
+        return {"error": str(exc), **exc.details}
+
+
+@mcp.tool()
+def authoring_reject(node_id: str, pack: str = DEFAULT_PACK,
+                     rejected_by: str | None = None, reason: str | None = None) -> dict:
+    """후보를 거부한다. 노드와 그 엣지는 버퍼에서 빠지고 draft 감사 기록에만 남는다."""
+    _ro = _read_only_block()
+    if _ro:
+        return _ro
+    try:
+        return local_authoring.engine_for(pack).reject(node_id, rejected_by, reason)
+    except local_authoring.AuthoringError as exc:
+        return {"error": str(exc), **exc.details}
 
 
 @mcp.tool()
@@ -1409,6 +1426,19 @@ def pack_authoring_sources(pack: str = DEFAULT_PACK, cursor: int = 0,
             )}
 
 
+def _promotion_gate(buf: dict, pack: str) -> dict | None:
+    """유크라테스 계약: 후보·검수 상태 노드는 완성 ZIP으로 나가지 못한다."""
+    unpromoted = local_authoring.unpromoted_node_ids(buf)
+    if not unpromoted:
+        return None
+    return {
+        "status": "needs_promotion", "pack": pack, "unpromoted_node_ids": unpromoted,
+        "next": ("authoring_promote(node_id=..., evidence_ids=[...])로 승격하거나 "
+                 "authoring_reject로 정리한 뒤 다시 호출하세요. candidate·validated 상태 노드는 "
+                 "완성 ZIP에 포함되지 않습니다."),
+    }
+
+
 def _authoring_coverage(buf: dict) -> tuple[list[str], list[str]]:
     """원문 Evidence가 Claim 또는 Kinetic에 실제로 투영됐는지 확인한다."""
     state = buf.get("authoring") or {}
@@ -1437,6 +1467,10 @@ def pack_authoring_complete(pack: str = DEFAULT_PACK) -> dict:
     if not state or not state.get("required"):
         return {"status": "not_required", "pack": pack,
                 "note": "원문 ZIP ingest로 시작한 팩이 아닙니다. pack_quality와 pack_qa를 확인하세요."}
+    gate = _promotion_gate(buf, pack)
+    if gate:
+        state["complete"] = False
+        return gate
     quality = _authoring_quality(buf)
     source_ids, covered = _authoring_coverage(buf)
     missing = sorted(set(source_ids) - set(covered))
@@ -1510,6 +1544,9 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
     buf = _get_pack(pack)
     if not buf["nodes"]:
         return {"error": f"팩이 비어 있습니다: {pack}"}
+    gate = _promotion_gate(buf, pack)
+    if gate:
+        return gate
     authoring = buf.get("authoring") or {}
     if authoring.get("required") and not authoring.get("complete"):
         source_ids, covered = _authoring_coverage(buf)
