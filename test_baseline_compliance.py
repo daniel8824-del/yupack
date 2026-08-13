@@ -124,14 +124,14 @@ def _compliance(**over):
     return base
 
 
-def _spec_zip(path, compliance, *, nodes=None, edges=None):
+def _spec_zip(path, compliance, *, nodes=None, edges=None, evidence=None):
     with zipfile.ZipFile(path, "w") as z:
         z.writestr("nodes.jsonl", "\n".join(json.dumps(n, ensure_ascii=False)
                                             for n in (nodes or SPEC_NODES)))
         z.writestr("edges.jsonl", "\n".join(json.dumps(e, ensure_ascii=False)
                                             for e in (edges or SPEC_EDGES)))
         z.writestr("evidence.jsonl", "\n".join(json.dumps(e, ensure_ascii=False)
-                                               for e in SPEC_EVIDENCE))
+                                               for e in (evidence or SPEC_EVIDENCE)))
         z.writestr("reviews.jsonl", "")
         z.writestr("quality/baseline-standard.snapshot.md", "# 기준 스냅샷 (저작 시점 사본)")
         z.writestr("quality/baseline-compliance.json", json.dumps(compliance, ensure_ascii=False))
@@ -188,6 +188,34 @@ def test_spec_gates_isolated_and_records_coverage_fail(tmp_path, monkeypatch):
     assert "records_coverage" in v["below_baseline"]
     assert v["baseline"]["isolated_sample"] == ["orphan:1"]
     assert v["baseline"]["uncovered_kinetic_sample"] == ["kin:2"]
+
+
+def test_gate7_locator_ceiling_blocks_license_overrun(tmp_path, monkeypatch):
+    """§4-7: Evidence locator가 본문 종료행을 넘으면 FAIL (구텐베르크 라이선스 침범 실사례)."""
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+    ev = [{"evidence_id": "ev:1", "summary": "본문 안",
+           "locator": {"chapter": "I", "start_line": 10, "end_line": 90}},
+          {"evidence_id": "ev:2", "summary": "라이선스 침범",
+           "locator": {"chapter": "II", "start_line": 95, "end_line": 150}}]
+    c = _compliance(source_body_end_line=100)
+    v = LocalPack(_spec_zip(tmp_path / "s.zip", c, evidence=ev)).verify_baseline()
+    assert v["status"] == "FAIL" and "locator_ceiling" in v["below_baseline"]
+    assert v["baseline"]["locator_over_sample"] == [["ev:2", 150]] or \
+        v["baseline"]["locator_over_sample"] == [("ev:2", 150)]
+
+
+def test_gate8_uniform_slicing_is_suspect_not_fail(tmp_path, monkeypatch):
+    """§4-8: 기계 등분 패턴(변동계수 비정상 저하)은 suspect 표시 — 자동 FAIL 아님."""
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+    ev = [{"evidence_id": f"ev:{i}", "summary": f"등분 {i}",
+           "locator": {"chapter": "I", "start_line": 1 + i * 20, "end_line": 20 + i * 20}}
+          for i in range(1, 6)]  # 정확히 20행 등분 5개 → CV 0
+    c = _compliance(source_body_end_line=1000)
+    v = LocalPack(_spec_zip(tmp_path / "s.zip", c, evidence=ev)).verify_baseline()
+    assert v["status"] == "PASS", v  # suspect는 실패가 아니다
+    assert v["baseline"]["uniform_slicing_suspects"], "등분 패턴이 suspect로 안 잡혔다"
+    assert any(g["item"] == "uniform_slicing" and g["verdict"] == "SUSPECT"
+               for g in v["baseline"]["gates"])
 
 
 def test_t1_preserves_both_quality_files_and_t6_mode(tmp_path, monkeypatch):

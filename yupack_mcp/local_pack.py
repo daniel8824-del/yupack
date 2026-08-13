@@ -834,13 +834,57 @@ class LocalPack:
                     continue
                 gate_items.append({"item": f"floor.{k}", "floor": want, "recomputed": rc,
                                    "verdict": "PASS" if rc >= want else "FAIL"})
+            # 게이트 7 (§4-7): locator 상한 — 라이선스·부록을 원문으로 서빙하는 것 차단
+            unverified_gates = []
+            body_end = comp.get("source_body_end_line")
+            spans = []  # (id, start, end, chapter)
+            for r_ in _jsonl(self._read("evidence.jsonl")):
+                loc = r_.get("locator") if isinstance(r_.get("locator"), dict) else {}
+                a_ = loc.get("start_line") or loc.get("line_start")
+                b_ = loc.get("end_line") or loc.get("line_end")
+                if isinstance(a_, int) and isinstance(b_, int):
+                    spans.append((r_.get("id") or r_.get("evidence_id"), a_, b_,
+                                  loc.get("chapter")))
+            locator_over = []
+            if isinstance(body_end, (int, float)) and spans:
+                locator_over = [(i_, b_) for i_, a_, b_, c_ in spans if b_ > body_end]
+                gate_items.append({"item": "locator_ceiling",
+                                   "recomputed": f"침범 {len(locator_over)}/{len(spans)}"
+                                                 f" (본문 종료 {int(body_end)}행)",
+                                   "verdict": "PASS" if not locator_over else "FAIL"})
+            elif spans and body_end is None:
+                unverified_gates.append("locator_ceiling: source_body_end_line 미신고")
+            elif isinstance(body_end, (int, float)) and not spans:
+                unverified_gates.append("locator_ceiling: 수치 locator 없음")
+            # 게이트 8 (§4-8): 등분 탐지 — 기계 등분(변동계수 비정상 저하)은 suspect.
+            # 자동 FAIL이 아니라 정독 검수 필수 대상 표시 (화원 실사례: '장 기억' 요약).
+            import statistics as _st
+            by_ch: dict = {}
+            for i_, a_, b_, c_ in spans:
+                by_ch.setdefault(c_, []).append(b_ - a_ + 1)
+            slicing_suspects = []
+            for c_, sizes in by_ch.items():
+                if len(sizes) >= 4:
+                    mean = _st.fmean(sizes)
+                    cv = (_st.pstdev(sizes) / mean) if mean else 0.0
+                    if cv < 0.1:  # 자연 저작은 구간 크기가 크게 출렁인다 (임계 재조정 가능)
+                        slicing_suspects.append({"chapter": c_, "n": len(sizes),
+                                                 "cv": round(cv, 3)})
+            gate_items.append({"item": "uniform_slicing",
+                               "recomputed": f"suspect 장 {len(slicing_suspects)}",
+                               "verdict": "SUSPECT" if slicing_suspects else "PASS"})
             below.extend(g["item"] for g in gate_items
                          if g["verdict"] == "FAIL" and g["item"] not in below)
             baseline = {"profile": comp.get("profile"), "declared_passed": comp.get("passed"),
-                        "source_lines": src_lines, "counts": counts, "per_1000": per_rc,
+                        "source_lines": src_lines,
+                        "source_body_end_line": body_end,
+                        "counts": counts, "per_1000": per_rc,
                         "gates": gate_items, "floor_unverified": floor_unverified,
+                        "unverified_gates": unverified_gates,
                         "isolated_sample": isolated[:4],
-                        "uncovered_kinetic_sample": uncovered_kin[:4]}
+                        "uncovered_kinetic_sample": uncovered_kin[:4],
+                        "locator_over_sample": locator_over[:4],
+                        "uniform_slicing_suspects": slicing_suspects[:6]}
 
         if mismatches:
             status, reason = "FAIL", "declared_mismatch"
