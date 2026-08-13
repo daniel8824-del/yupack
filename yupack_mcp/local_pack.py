@@ -476,6 +476,17 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
                     "edge_refs_resolved": "deferred_to_open(무결성은 open 시 재검증)",
                     "reviews_preserved": len(reviews)},
     }, ensure_ascii=False, indent=1).encode()
+    # 품질층 보존 (T1): 원본 zip의 quality/ 문서를 재구성 후에도 그대로 담는다.
+    # manifest·integrity 해시 계산 전에 넣어, 변조 시 무결성 검증도 함께 깨지게 한다.
+    nd_path = find("nodes.jsonl") or ""
+    base = nd_path[: -len("nodes.jsonl")] if nd_path else ""
+    if base.endswith("graph/"):
+        base = base[: -len("graph/")]
+    for n in names:
+        if "quality/" in n and n.endswith(".json"):
+            rel = n[len(base):] if base and n.startswith(base) else "quality/" + n.split("quality/", 1)[1]
+            files.setdefault(rel, z.read(n))
+
     manifest = {"schema": "yucrates.ontology.v1.2", "index_version": 1,
                 "created": _now(), "embed_model": EMBED_MODEL if emb_meta else None,
                 "embed_dim": EMBED_DIM if emb_meta else None,
@@ -642,9 +653,121 @@ class LocalPack:
     def status(self) -> dict:
         return {"pack_id": self.pack_id, "manifest_hash": self.manifest_hash,
                 "mode": self.mode, "integrity": self.integrity,
+                "baseline_compliance": self._baseline_summary(),
                 "counts": {"nodes": len(self.nodes), "evidence": len(self.evidence),
                             "reviews": sum(len(v) for v in self.reviews.values()),
                             "vectors": len(self.vec_meta), "adjacency": len(self.adj)}}
+
+    # --- 품질층 (T2 노출 · T3 재계산 대조) ---
+    def _quality_docs(self) -> dict[str, dict]:
+        import glob as _glob
+        docs: dict[str, dict] = {}
+        pats = [os.path.join(self.root, "quality", "*.json"),
+                os.path.join(self.root, "*", "quality", "*.json"),
+                os.path.join(self.root, "*", "*", "quality", "*.json")]
+        for pat in pats:
+            for p in _glob.glob(pat):
+                if "__MACOSX" in p or os.path.basename(p).startswith("._"):
+                    continue
+                rel = os.path.relpath(p, self.root)
+                try:
+                    docs[rel] = json.load(open(p, encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    docs[rel] = {"_unparseable": True}
+        return docs
+
+    def _baseline_summary(self) -> dict:
+        """status()용 요약. 부재 시 {present: false} — 구세대 팩 하위호환, 오류 금지."""
+        docs = self._quality_docs()
+        if not docs:
+            return {"present": False}
+        checks: dict[str, bool] = {}
+        for doc in docs.values():
+            checks.update({k: bool(v) for k, v in (doc.get("checks") or {}).items()})
+        return {"present": True, "files": sorted(docs),
+                "declared_checks": {"true": sum(1 for v in checks.values() if v),
+                                     "total": len(checks)},
+                "verify": "pack_verify_baseline로 재계산 대조 (자기 신고는 신뢰하지 않음)"}
+
+    _BASELINE_RECOMPUTABLE = ("all_edges_resolve", "unique_nodes", "unique_evidence",
+                              "fts_count_matches_nodes", "openai_vector_materialized")
+
+    def verify_baseline(self) -> dict:
+        """quality/ 자기 신고를 nodes/edges/인덱스에서 재계산해 대조한다 (T3).
+
+        신고를 그대로 믿지 않는다. 재계산과 어긋나면 FAIL(declared_mismatch, 조작 탐지),
+        핵심 기준을 어기면 FAIL(below_baseline), 문서가 없으면 absent (오류 아님).
+        neo4j·qmd 컬렉션 같은 환경 주장은 zip만으로 재계산 불가 — unverifiable로 표시만 한다.
+        """
+        docs = self._quality_docs()
+        if not docs:
+            return {"status": "absent", "present": False,
+                    "note": "quality/ 문서가 없는 팩 (구세대 정본 하위호환) — 오류 아님"}
+        node_lines = [l for l in self._read("nodes.jsonl").splitlines() if l.strip()]
+        edge_lines = [l for l in self._read("edges.jsonl").splitlines() if l.strip()]
+        node_ids = [json.loads(l).get("id") for l in node_lines]
+        node_set = set(node_ids)
+        ev_ids = [e.get("evidence_id") or e.get("id")
+                  for e in _jsonl(self._read("evidence.jsonl"))]
+        unresolved = []
+        for l in edge_lines:
+            e = json.loads(l)
+            s, t = e.get("source") or e.get("from_id"), e.get("target") or e.get("to_id")
+            if s not in node_set or t not in node_set:
+                unresolved.append(f"{s}->{t}")
+        fts_docs = None
+        for cand in ("lexical-index/fts.sqlite", "indexes/lexical.sqlite"):
+            p = os.path.join(self.root, cand)
+            if os.path.exists(p):
+                try:
+                    con = sqlite3.connect(p)
+                    fts_docs = con.execute("SELECT COUNT(*) FROM docs").fetchone()[0]
+                    con.close()
+                except sqlite3.OperationalError:
+                    pass
+                break
+        recomputed = {
+            "count_nodes": len(node_lines), "count_edges": len(edge_lines),
+            "all_edges_resolve": not unresolved,
+            "unique_nodes": len(node_ids) == len(node_set),
+            "unique_evidence": len(ev_ids) == len(set(ev_ids)),
+            "fts_docs": fts_docs,
+            "fts_count_matches_nodes": (fts_docs == len(node_lines)) if fts_docs is not None else None,
+            "openai_vector_materialized": bool(self.vec_meta) and self.dim == 3072,
+        }
+        mismatches, unverifiable = [], set()
+        for rel, doc in docs.items():
+            if doc.get("_unparseable"):
+                mismatches.append({"file": rel, "check": "_parse",
+                                   "declared": "json", "recomputed": "unparseable"})
+                continue
+            for k, declared in (doc.get("checks") or {}).items():
+                if k in self._BASELINE_RECOMPUTABLE and recomputed.get(k) is not None:
+                    if bool(declared) != bool(recomputed[k]):
+                        mismatches.append({"file": rel, "check": k,
+                                           "declared": bool(declared),
+                                           "recomputed": recomputed[k]})
+                else:
+                    unverifiable.add(k)
+            counts = doc.get("counts") or {}
+            for k in ("nodes", "edges"):
+                want = counts.get(k)
+                if isinstance(want, int) and want != recomputed[f"count_{k}"]:
+                    mismatches.append({"file": rel, "check": f"counts.{k}",
+                                       "declared": want, "recomputed": recomputed[f"count_{k}"]})
+        below = [k for k in ("all_edges_resolve", "unique_nodes", "unique_evidence")
+                 if recomputed[k] is False]
+        if mismatches:
+            status, reason = "FAIL", "declared_mismatch"
+        elif below:
+            status, reason = "FAIL", "below_baseline"
+        else:
+            status, reason = "PASS", None
+        return {"status": status, "present": True, "reason": reason,
+                "files": sorted(docs), "recomputed": recomputed,
+                "mismatches": mismatches[:8], "below_baseline": below,
+                "unverifiable_checks": sorted(unverifiable),
+                "unresolved_edges_sample": unresolved[:4]}
 
     # --- retrieval 3종 ---
     def lexical(self, q: str, k: int = 8) -> list[dict]:

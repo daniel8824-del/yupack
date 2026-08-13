@@ -1369,6 +1369,20 @@ def pack_status(pack_handle: str) -> dict:
 
 
 @mcp.tool()
+def pack_verify_baseline(pack_handle: str) -> dict:
+    """팩 품질층(quality/*.json)의 자기 신고를 nodes/edges/인덱스에서 재계산해 대조한다.
+
+    신고를 그대로 믿지 않는다: 어긋나면 FAIL(declared_mismatch, 조작 탐지),
+    핵심 기준 위반이면 FAIL(below_baseline), 품질층이 없으면 absent(구세대 팩, 오류 아님).
+    유팩은 읽기 도구다 — 판정만 하고 팩을 수정하지 않는다."""
+    from . import local_pack
+    pk = local_pack.get(pack_handle)
+    if not pk:
+        return {"error": f"핸들 없음: {pack_handle}"}
+    return {**pk.verify_baseline(), "source_revision": SOURCE_REVISION}
+
+
+@mcp.tool()
 def pack_ask_local(question: str, pack_handle: str = "", top_k: int = 6) -> dict:
     """열린 로컬 팩에 질의한다. lexical+vector+graph 3중 검색, 근거 카드와
     retrieval_trace를 반환하며 근거가 없으면 no_local_evidence를 반환한다.
