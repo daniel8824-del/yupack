@@ -243,13 +243,27 @@ def _jsonl(text: str) -> list[dict]:
 
 
 def _norm_evidence(e: dict) -> dict:
+    """evidence.jsonl 행을 카드 계약으로 정규화한다.
+
+    스키마가 팩 세대마다 다르다: 구형 flat(text/condition/grade), 정본 11권형
+    (최상위 id/summary + 중첩 locator{} + properties{text|summary|short_quote}).
+    키를 못 찾으면 카드 summary가 조용히 null이 되어 저자 대화에서 근거 요약문이
+    빠진다 (북팩 레인 인계 findings 2026-08-13) — 양쪽 키를 전부 수용한다.
+    """
     if "evidence_id" in e:
         return e
-    return {"evidence_id": e.get("id"), "summary": e.get("text") or e.get("metric_or_observation"),
-            "conditions": e.get("condition"), "limitations": e.get("limitation"),
-            "evidence_grade": e.get("grade"), "evidence_kind": e.get("canonical_layer"),
-            "source_id": e.get("source_id"), "source_locator": e.get("source_locator"),
-            "verbatim_or_paraphrase": e.get("verbatim_or_paraphrase")}
+    props = e.get("properties") or {}
+    return {"evidence_id": e.get("id"),
+            "summary": (e.get("summary") or e.get("text") or props.get("summary")
+                        or props.get("text") or props.get("short_quote")
+                        or e.get("metric_or_observation")),
+            "conditions": e.get("condition") or e.get("conditions") or props.get("conditions"),
+            "limitations": e.get("limitation") or e.get("limitations") or props.get("limitations"),
+            "evidence_grade": e.get("grade") or e.get("evidence_grade") or props.get("evidence_grade"),
+            "evidence_kind": e.get("canonical_layer") or props.get("kind"),
+            "source_id": e.get("source_id") or props.get("source_id"),
+            "source_locator": e.get("source_locator") or e.get("locator"),
+            "verbatim_or_paraphrase": e.get("verbatim_or_paraphrase") or props.get("verbatim_or_paraphrase")}
 
 
 # ======================= 빌드: 정본 zip -> queryable zip =======================
@@ -879,8 +893,9 @@ class LocalPack:
             for k in ("locator", "source_path"):
                 if p.get(k) and not out.get(k):
                     out[k] = p[k]
-            if not out.get("summary") and p.get("text"):
-                out["summary"] = p["text"]
+            if not out.get("summary"):
+                # 노드 쪽 복구: 구형은 properties.text, 신형 6권은 properties.summary
+                out["summary"] = p.get("text") or p.get("summary") or p.get("short_quote")
             return out
         n = self.nodes.get(nid)
         if not n:
