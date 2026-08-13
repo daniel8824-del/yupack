@@ -89,6 +89,125 @@ def test_t3_absent_is_not_an_error(tmp_path, monkeypatch):
     assert v["status"] == "absent" and v["present"] is False
 
 
+# ── §6 baseline-compliance.json 스키마 (발주 전문 기준) ──
+SPEC_NODES = [
+    {"id": "ev:1", "space": "evidence", "node_type": "TextUnit",
+     "properties": {"label": "근거 1", "text": "근거 본문 하나", "source_locator": "1행"}},
+    {"id": "ev:2", "space": "evidence", "node_type": "TextUnit",
+     "properties": {"label": "근거 2", "text": "근거 본문 둘", "source_locator": "2행"}},
+    {"id": "kin:1", "space": "kinetic", "node_type": "Event", "properties": {"label": "사건 1"}},
+    {"id": "theme:1", "space": "concept", "node_type": "Topic",
+     "properties": {"label": "주제 1", "definition": "주제"}},
+    {"id": "claim:1", "space": "claim", "node_type": "Claim",
+     "properties": {"label": "주장 1", "text": "주장", "evidence_refs": ["ev:1"]}},
+]
+SPEC_EDGES = [
+    {"source": "ev:1", "target": "kin:1", "relation": "records", "properties": {}},
+    {"source": "ev:2", "target": "claim:1", "relation": "supports", "properties": {}},
+    {"source": "ev:1", "target": "theme:1", "relation": "describes", "properties": {}},
+]
+SPEC_EVIDENCE = [{"evidence_id": "ev:1", "summary": "근거 본문 하나", "source_locator": "1행"},
+                 {"evidence_id": "ev:2", "summary": "근거 본문 둘", "source_locator": "2행"}]
+
+
+def _compliance(**over):
+    base = {
+        "profile": "서사류", "source_lines": 1000, "source_sha256": "deadbeef",
+        "measured": {"evidence": 2, "kinetic": 1, "theme": 1, "claim": 1,
+                     "grammar_kinds": 3, "per_1000": {"evidence": 2.0, "kinetic": 1.0}},
+        "floors": {"evidence_per_1000": 1, "kinetic_per_1000": 0.5,
+                   "theme": 1, "claim": 1, "grammar_kinds": 2},
+        "gates": {"isolated_nodes": 0, "records_coverage": "1/1"},
+        "passed": True,
+    }
+    base.update(over)
+    return base
+
+
+def _spec_zip(path, compliance, *, nodes=None, edges=None):
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("nodes.jsonl", "\n".join(json.dumps(n, ensure_ascii=False)
+                                            for n in (nodes or SPEC_NODES)))
+        z.writestr("edges.jsonl", "\n".join(json.dumps(e, ensure_ascii=False)
+                                            for e in (edges or SPEC_EDGES)))
+        z.writestr("evidence.jsonl", "\n".join(json.dumps(e, ensure_ascii=False)
+                                               for e in SPEC_EVIDENCE))
+        z.writestr("reviews.jsonl", "")
+        z.writestr("quality/baseline-standard.snapshot.md", "# 기준 스냅샷 (저작 시점 사본)")
+        z.writestr("quality/baseline-compliance.json", json.dumps(compliance, ensure_ascii=False))
+    return str(path)
+
+
+def test_spec_schema_normal_pass_and_summary_shape(tmp_path, monkeypatch):
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+    lp = LocalPack(_spec_zip(tmp_path / "s.zip", _compliance()))
+    v = lp.verify_baseline()
+    assert v["status"] == "PASS", v
+    assert v["baseline"]["profile"] == "서사류"
+    assert all(g["verdict"] == "PASS" for g in v["baseline"]["gates"])
+    bc = lp.status()["baseline_compliance"]  # T2 발주 형태
+    assert bc["present"] is True and bc["profile"] == "서사류" and bc["passed"] is True
+    assert bc["per_1000"] == {"evidence": 2.0, "kinetic": 1.0}
+
+
+def test_spec_schema_tampered_measured_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+    c = _compliance()
+    c["measured"] = {**c["measured"], "kinetic": 9,
+                     "per_1000": {"evidence": 2.0, "kinetic": 9.0}}
+    v = LocalPack(_spec_zip(tmp_path / "s.zip", c)).verify_baseline()
+    assert v["status"] == "FAIL" and v["reason"] == "declared_mismatch"
+    assert any(m["check"] == "measured.kinetic" for m in v["mismatches"])
+
+
+def test_spec_schema_below_floor_fails_honest(tmp_path, monkeypatch):
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+    c = _compliance(floors={"kinetic_per_1000": 50}, passed=False)
+    v = LocalPack(_spec_zip(tmp_path / "s.zip", c)).verify_baseline()
+    assert v["status"] == "FAIL" and v["reason"] == "below_baseline"
+    assert "floor.kinetic_per_1000" in v["below_baseline"]
+    assert not v["mismatches"]  # 신고는 정직 — 조작이 아니라 미달
+
+
+def test_spec_gates_isolated_and_records_coverage_fail(tmp_path, monkeypatch):
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+    nodes = SPEC_NODES + [
+        {"id": "orphan:1", "space": "concept", "node_type": "Concept",
+         "properties": {"label": "고립 노드"}},
+        {"id": "kin:2", "space": "kinetic", "node_type": "Event",
+         "properties": {"label": "근거 없는 사건"}},
+    ]
+    edges = SPEC_EDGES + [
+        {"source": "kin:2", "target": "theme:1", "relation": "about", "properties": {}}]
+    c = _compliance()
+    c["measured"] = {**c["measured"], "kinetic": 2,
+                     "grammar_kinds": 4, "per_1000": {"evidence": 2.0, "kinetic": 2.0}}
+    v = LocalPack(_spec_zip(tmp_path / "s.zip", c, nodes=nodes, edges=edges)).verify_baseline()
+    assert v["status"] == "FAIL" and v["reason"] == "below_baseline"
+    assert "isolated_nodes" in v["below_baseline"]
+    assert "records_coverage" in v["below_baseline"]
+    assert v["baseline"]["isolated_sample"] == ["orphan:1"]
+    assert v["baseline"]["uncovered_kinetic_sample"] == ["kin:2"]
+
+
+def test_t1_preserves_both_quality_files_and_t6_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+    src = _spec_zip(tmp_path / "src.zip", _compliance())
+    out = str(tmp_path / "out.zip")
+    r = build_queryable(src, out, include_embeddings=False)
+    assert "error" not in r
+    with zipfile.ZipFile(out) as z:
+        names = z.namelist()
+        assert "quality/baseline-compliance.json" in names
+        assert "quality/baseline-standard.snapshot.md" in names  # md도 보존 (2종 계약)
+    lp = LocalPack(out)
+    assert lp.integrity == "ok"
+    assert lp.verify_baseline()["status"] == "PASS"
+    ans = lp.ask("근거 본문 하나", 3)
+    # 발주 T6: 벡터 없는 환경에서 조용한 저하 금지 — 모드 명시
+    assert ans["retrieval_trace"]["mode"] == "lexical-only"
+
+
 def test_existing_final_packs_never_fail(monkeypatch):
     """기존 정본 팩을 깨뜨리는 구현은 실패다 — 전수에서 PASS 또는 absent만 허용."""
     monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")

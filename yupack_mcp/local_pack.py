@@ -483,7 +483,8 @@ def build_queryable(source_zip: str, out_zip: str | None = None,
     if base.endswith("graph/"):
         base = base[: -len("graph/")]
     for n in names:
-        if "quality/" in n and n.endswith(".json"):
+        # 2종 계약: baseline-standard.snapshot.md + baseline-compliance.json — md도 보존
+        if "quality/" in n and not n.endswith("/"):
             rel = n[len(base):] if base and n.startswith(base) else "quality/" + n.split("quality/", 1)[1]
             files.setdefault(rel, z.read(n))
 
@@ -677,10 +678,23 @@ class LocalPack:
         return docs
 
     def _baseline_summary(self) -> dict:
-        """status()용 요약. 부재 시 {present: false} — 구세대 팩 하위호환, 오류 금지."""
+        """status()용 요약. 부재 시 {present: false} — 구세대 팩 하위호환, 오류 금지.
+
+        baseline-compliance.json(§6 스키마)이 있으면 발주 계약 형태
+        {present, profile, passed, per_1000:{evidence,kinetic}}로 요약한다.
+        """
         docs = self._quality_docs()
         if not docs:
             return {"present": False}
+        comp = next((d for rel, d in docs.items()
+                     if rel.endswith("baseline-compliance.json") and isinstance(d, dict)), None)
+        if comp and "measured" in comp:
+            per = (comp.get("measured") or {}).get("per_1000") or {}
+            return {"present": True, "profile": comp.get("profile"),
+                    "passed": comp.get("passed"),
+                    "per_1000": {"evidence": per.get("evidence"), "kinetic": per.get("kinetic")},
+                    "files": sorted(docs),
+                    "verify": "pack_verify_baseline로 재계산 대조 (자기 신고는 신뢰하지 않음)"}
         checks: dict[str, bool] = {}
         for doc in docs.values():
             checks.update({k: bool(v) for k, v in (doc.get("checks") or {}).items()})
@@ -703,16 +717,17 @@ class LocalPack:
         if not docs:
             return {"status": "absent", "present": False,
                     "note": "quality/ 문서가 없는 팩 (구세대 정본 하위호환) — 오류 아님"}
-        node_lines = [l for l in self._read("nodes.jsonl").splitlines() if l.strip()]
-        edge_lines = [l for l in self._read("edges.jsonl").splitlines() if l.strip()]
-        node_ids = [json.loads(l).get("id") for l in node_lines]
+        nodes_p = _jsonl(self._read("nodes.jsonl"))
+        edges_p = _jsonl(self._read("edges.jsonl"))
+        node_ids = [n.get("id") for n in nodes_p]
         node_set = set(node_ids)
         ev_ids = [e.get("evidence_id") or e.get("id")
                   for e in _jsonl(self._read("evidence.jsonl"))]
-        unresolved = []
-        for l in edge_lines:
-            e = json.loads(l)
+        unresolved, touched = [], set()
+        for e in edges_p:
             s, t = e.get("source") or e.get("from_id"), e.get("target") or e.get("to_id")
+            touched.add(s)
+            touched.add(t)
             if s not in node_set or t not in node_set:
                 unresolved.append(f"{s}->{t}")
         fts_docs = None
@@ -727,12 +742,12 @@ class LocalPack:
                     pass
                 break
         recomputed = {
-            "count_nodes": len(node_lines), "count_edges": len(edge_lines),
+            "count_nodes": len(nodes_p), "count_edges": len(edges_p),
             "all_edges_resolve": not unresolved,
             "unique_nodes": len(node_ids) == len(node_set),
             "unique_evidence": len(ev_ids) == len(set(ev_ids)),
             "fts_docs": fts_docs,
-            "fts_count_matches_nodes": (fts_docs == len(node_lines)) if fts_docs is not None else None,
+            "fts_count_matches_nodes": (fts_docs == len(nodes_p)) if fts_docs is not None else None,
             "openai_vector_materialized": bool(self.vec_meta) and self.dim == 3072,
         }
         mismatches, unverifiable = [], set()
@@ -757,6 +772,76 @@ class LocalPack:
                                        "declared": want, "recomputed": recomputed[f"count_{k}"]})
         below = [k for k in ("all_edges_resolve", "unique_nodes", "unique_evidence")
                  if recomputed[k] is False]
+
+        # ── §6 baseline-compliance.json 전용 재계산 대조 (발주 T3) ──
+        # measured(evidence·kinetic·theme·claim·grammar_kinds·per_1000)를 nodes/edges
+        # 재계산값과 대조하고, 기계 판정 게이트(고립 0·records 커버리지·밀도 하한)를 실측한다.
+        baseline = None
+        comp = next((d for rel, d in docs.items()
+                     if rel.endswith("baseline-compliance.json") and isinstance(d, dict)
+                     and "measured" in d), None)
+        if comp:
+            m = comp.get("measured") or {}
+            counts = {
+                "evidence": sum(1 for n in nodes_p if n.get("space") == "evidence"),
+                "kinetic": sum(1 for n in nodes_p if n.get("space") == "kinetic"),
+                "theme": sum(1 for n in nodes_p if n.get("node_type") in ("Theme", "Topic")),
+                "claim": sum(1 for n in nodes_p if n.get("space") == "claim"),
+                "grammar_kinds": len({e.get("relation") for e in edges_p if e.get("relation")}),
+            }
+            src_lines = comp.get("source_lines")
+            per_rc = {}
+            if isinstance(src_lines, (int, float)) and src_lines:
+                per_rc = {"evidence": round(counts["evidence"] / src_lines * 1000, 1),
+                          "kinetic": round(counts["kinetic"] / src_lines * 1000, 1)}
+            for k, rc in counts.items():
+                want = m.get(k)
+                if isinstance(want, (int, float)) and int(want) != rc:
+                    mismatches.append({"file": "quality/baseline-compliance.json",
+                                       "check": f"measured.{k}", "declared": want, "recomputed": rc})
+            decl_per = m.get("per_1000") or {}
+            for k in ("evidence", "kinetic"):
+                want = decl_per.get(k)
+                if isinstance(want, (int, float)) and k in per_rc and abs(want - per_rc[k]) > 0.15:
+                    mismatches.append({"file": "quality/baseline-compliance.json",
+                                       "check": f"measured.per_1000.{k}",
+                                       "declared": want, "recomputed": per_rc[k]})
+            isolated = [nid for nid in node_ids if nid not in touched]
+            kin_ids = [n.get("id") for n in nodes_p if n.get("space") == "kinetic"]
+            ev_space = {n.get("id") for n in nodes_p if n.get("space") == "evidence"}
+            rec_to = {e.get("target") or e.get("to_id") for e in edges_p
+                      if e.get("relation") == "records"
+                      and (e.get("source") or e.get("from_id")) in ev_space}
+            uncovered_kin = [k_ for k_ in kin_ids if k_ not in rec_to]
+            gate_items = [
+                {"item": "isolated_nodes", "recomputed": len(isolated),
+                 "verdict": "PASS" if not isolated else "FAIL"},
+                {"item": "records_coverage",
+                 "recomputed": f"{len(kin_ids) - len(uncovered_kin)}/{len(kin_ids)}",
+                 "verdict": "PASS" if not uncovered_kin else "FAIL"},
+            ]
+            floor_map = {"theme": counts["theme"], "claim": counts["claim"],
+                         "grammar_kinds": counts["grammar_kinds"],
+                         "evidence": per_rc.get("evidence"),
+                         "kinetic": per_rc.get("kinetic"),
+                         "evidence_per_1000": per_rc.get("evidence"),
+                         "kinetic_per_1000": per_rc.get("kinetic")}
+            floor_unverified = []
+            for k, want in (comp.get("floors") or {}).items():
+                rc = floor_map.get(k)
+                if rc is None or not isinstance(want, (int, float)):
+                    floor_unverified.append(k)
+                    continue
+                gate_items.append({"item": f"floor.{k}", "floor": want, "recomputed": rc,
+                                   "verdict": "PASS" if rc >= want else "FAIL"})
+            below.extend(g["item"] for g in gate_items
+                         if g["verdict"] == "FAIL" and g["item"] not in below)
+            baseline = {"profile": comp.get("profile"), "declared_passed": comp.get("passed"),
+                        "source_lines": src_lines, "counts": counts, "per_1000": per_rc,
+                        "gates": gate_items, "floor_unverified": floor_unverified,
+                        "isolated_sample": isolated[:4],
+                        "uncovered_kinetic_sample": uncovered_kin[:4]}
+
         if mismatches:
             status, reason = "FAIL", "declared_mismatch"
         elif below:
@@ -765,6 +850,7 @@ class LocalPack:
             status, reason = "PASS", None
         return {"status": status, "present": True, "reason": reason,
                 "files": sorted(docs), "recomputed": recomputed,
+                "baseline": baseline,
                 "mismatches": mismatches[:8], "below_baseline": below,
                 "unverifiable_checks": sorted(unverifiable),
                 "unresolved_edges_sample": unresolved[:4]}
@@ -1396,6 +1482,8 @@ class LocalPack:
             "review_status": {c["id"]: c["review_status"] for c in cards
                                if c.get("id") and c.get("review_status")},
             "retrieval_trace": {"lexical_hits": lex[:8], "vector_hits": vec[:5],
+                                 # 정직한 폴백 표기 (발주 T6): 조용한 성능 저하 금지
+                                 "mode": "hybrid" if vec else "lexical-only",
                                  "axis_receipts": self._axis_receipts(gtrace, ctrace),
                                  "graph_path": gtrace[:30],
                                  "causal_path": ctrace[:40],
