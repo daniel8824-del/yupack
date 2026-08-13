@@ -535,6 +535,10 @@ class LocalPack:
     def __init__(self, zip_path: str, mode: str = "read_only"):
         self.zip_path = os.path.expanduser(zip_path)
         self.mode = mode
+        if os.path.isdir(self.zip_path):
+            # 노트팩(옵시디언 노트 폴더) — zip 생산 폐기 전환(2026-08-13 오너 결정)의 소비면
+            self._init_notepack(self.zip_path)
+            return
         raw = open(self.zip_path, "rb").read()
         self.pack_id = os.path.basename(self.zip_path)
         self.manifest_hash = _sha256(raw)
@@ -640,10 +644,140 @@ class LocalPack:
                 return open(path, encoding="utf-8").read()
         return ""
 
+    # ── 노트팩 로더: 옵시디언 노트 폴더 → 같은 3축 질의 엔진 ──
+    _NOTE_SPACE = {"Event": "kinetic", "Action": "kinetic", "State": "kinetic",
+                   "Process": "kinetic", "Claim": "claim", "Covariate": "claim",
+                   "TextUnit": "evidence", "Evidence": "evidence",
+                   "LogEntry": "evidence", "Study": "evidence", "Source": "resource"}
+    _REL_LINE = re.compile(r"^([a-z_]+)::\s*\[\[(.+?)\]\]\s*$")
+
+    def _init_notepack(self, root: str) -> None:
+        """frontmatter(type·node_id·aliases) + `동사:: [[대상]]` 노트를 nodes/edges로 파싱한다.
+
+        노트가 정본이다: zip 아티팩트(FTS·벡터·integrity) 없이 폴더만으로
+        어휘(인메모리 FTS) + 벡터(qmd) + 그래프 3축 질의·거절·영수증 계약을 그대로 제공한다.
+        읽기 전용 — 볼트 폴더 안에 어떤 파일도 만들지 않는다 (audit 기록도 끔).
+        """
+        self.pack_id = os.path.basename(os.path.normpath(root))
+        self.root = root
+        self.cache = root
+        self._no_audit = True
+        notes = []
+        h = hashlib.sha256()
+        for dirpath, dirs, fs in os.walk(root):
+            dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+            for f in sorted(fs):
+                if not f.endswith(".md"):
+                    continue
+                try:
+                    text = open(os.path.join(dirpath, f), encoding="utf-8").read()
+                except OSError:
+                    continue
+                h.update(f.encode())
+                h.update(_sha256(text.encode()).encode())
+                fm, body = self._parse_frontmatter(text)
+                if not fm.get("type") or fm.get("type") == "MOC":
+                    continue  # MOC·프론트매터 없는 문서는 노드가 아니다
+                nid = fm.get("node_id") or os.path.splitext(f)[0]
+                rels, locator, orig, kept = [], None, None, []
+                for ln in body.splitlines():
+                    m = self._REL_LINE.match(ln.strip())
+                    if m:
+                        rels.append((m.group(1), m.group(2)))
+                        continue
+                    m2 = re.match(r"^행::\s*(\d+)\s*~\s*(\d+)", ln.strip())
+                    if m2:
+                        locator = {"start_line": int(m2.group(1)), "end_line": int(m2.group(2))}
+                        continue
+                    m3 = re.match(r"^원문::\s*\[\[(.+?)\]\]", ln.strip())
+                    if m3:
+                        orig = m3.group(1)
+                        continue
+                    kept.append(ln)
+                body_text = re.sub(r"^#+\s.*$", "", "\n".join(kept), flags=re.M).strip()
+                extras = {k: v for k, v in fm.items()
+                          if k not in ("title", "tags", "date", "type", "node_id", "aliases")
+                          and isinstance(v, str) and v}
+                notes.append({"id": nid, "label": fm.get("title") or os.path.splitext(f)[0],
+                              "type": fm.get("type"), "aliases": fm.get("aliases") or [],
+                              "extras": extras,
+                              "body": body_text, "rels": rels, "locator": locator,
+                              "orig": orig, "stem": os.path.splitext(f)[0]})
+        self.manifest_hash = h.hexdigest()
+        self.integrity = "notepack"
+        stem2id: dict[str, str] = {}
+        for n in notes:
+            stem2id.setdefault(n["stem"], n["id"])
+            stem2id.setdefault(n["label"], n["id"])
+        self.nodes, self.evidence, self.adj = {}, {}, {}
+        for n in notes:
+            space = self._NOTE_SPACE.get(n["type"], "concept")
+            props: dict = {"label": n["label"], "label_ko": n["label"]}
+            # frontmatter의 나머지 스칼라(assertion_mode·confidence·story_order 등)를
+            # 속성으로 왕복시킨다 — 노트가 전 필드 정본이 되는 조건
+            props.update(n.get("extras") or {})
+            if n["aliases"]:
+                props["aliases_ko"] = n["aliases"]
+            if n["body"]:
+                props["text"] = n["body"][:1500]
+            if n["locator"]:
+                props["locator"] = n["locator"]
+            if n["orig"]:
+                props["source_path"] = n["orig"]
+            self.nodes[n["id"]] = {"id": n["id"], "space": space, "node_type": n["type"],
+                                    "label": n["label"], "properties": props}
+            if space == "evidence":
+                self.evidence[n["id"]] = _norm_evidence(
+                    {"id": n["id"], "summary": n["body"][:500] or n["label"],
+                     "locator": n["locator"], "source_id": n["orig"]})
+        for n in notes:
+            for rel, target in n["rels"]:
+                tid = stem2id.get(target)
+                if not tid or tid not in self.nodes:
+                    continue
+                self.adj.setdefault(n["id"], []).append([rel, tid])
+                self.adj.setdefault(tid, []).append(["~" + rel, n["id"]])
+        self.reviews = {}
+        self.vec_meta, self.vecs = [], b""
+        self.embed_model, self.dim = EMBED_MODEL, EMBED_DIM
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE VIRTUAL TABLE docs USING fts5(id, kind, text)")
+        for nid, nd in self.nodes.items():
+            p = nd["properties"]
+            doc = " ".join(str(x) for x in [p.get("label"), *(p.get("aliases_ko") or []),
+                                             p.get("text")] if x)
+            con.execute("INSERT INTO docs VALUES(?,?,?)", (nid, nd["node_type"], doc))
+        con.commit()
+        self._fts_conn = con
+
+    @staticmethod
+    def _parse_frontmatter(text: str) -> tuple[dict, str]:
+        if not text.startswith("---"):
+            return {}, text
+        end = text.find("\n---", 3)
+        if end < 0:
+            return {}, text
+        head, body = text[3:end], text[end + 4:]
+        fm: dict = {}
+        key = None
+        for ln in head.splitlines():
+            m = re.match(r"^(\w+):\s*(.*)$", ln)
+            if m:
+                key = m.group(1)
+                val = m.group(2).strip().strip('"')
+                fm[key] = val if val else []
+            elif key is not None and re.match(r"^\s+-\s+", ln):
+                if not isinstance(fm.get(key), list):
+                    fm[key] = []
+                fm[key].append(ln.split("-", 1)[1].strip().strip('"'))
+        return fm, body
+
     def _runtime_db(self):
         return sqlite3.connect(os.path.join(self.root, "runtime", "ontology.sqlite"))
 
     def _audit(self, action: str, detail: str, actor: str = "local"):
+        if getattr(self, "_no_audit", False):
+            return  # 노트팩은 읽기 전용 — 볼트에 runtime sqlite를 만들지 않는다
         try:
             with self._runtime_db() as c:
                 c.execute("INSERT INTO audit_events(ts, actor, action, detail) VALUES(?,?,?,?)",
@@ -900,19 +1034,8 @@ class LocalPack:
                 "unresolved_edges_sample": unresolved[:4]}
 
     # --- retrieval 3종 ---
-    def lexical(self, q: str, k: int = 8) -> list[dict]:
-        # 축 영수증: 실패를 빈 배열로 숨기지 않고 사유를 남긴다 (관측 계약)
-        self._lexical_receipt = {"status": "ok", "hits": 0}
-        p = os.path.join(self.root, "lexical-index", "fts.sqlite")
-        if not os.path.exists(p):
-            p = os.path.join(self.root, "indexes", "lexical.sqlite")
-        if not os.path.exists(p):
-            self._lexical_receipt = {"status": "unavailable: lexical-index가 팩에 없음", "hits": 0}
-            return []
-        toks = [t for t in re.findall(r"[\w가-힣]+", q)
-                if len(t) >= 2 or re.fullmatch(r"[가-힣]", t)]
-        if not toks:
-            return []
+    @staticmethod
+    def _fts_terms(toks: list[str]) -> list[str]:
         # 한국어 조사 대응: 각 토큰의 절단형(prefix*)도 함께 질의 ("프랑스혁명이" -> 프랑스혁명*)
         # 1글자 한글(소·개·활)은 정확 일치로만 질의 (prefix는 소음)
         terms = []
@@ -925,6 +1048,36 @@ class LocalPack:
                     terms.append(f'"{cut}" *'.replace('" *', '"*'))
                 elif len(cut) == 1 and re.fullmatch(r"[가-힣]", cut):
                     terms.append(f'"{cut}"')
+        return terms
+
+    def lexical(self, q: str, k: int = 8) -> list[dict]:
+        # 축 영수증: 실패를 빈 배열로 숨기지 않고 사유를 남긴다 (관측 계약)
+        self._lexical_receipt = {"status": "ok", "hits": 0}
+        toks = [t for t in re.findall(r"[\w가-힣]+", q)
+                if len(t) >= 2 or re.fullmatch(r"[가-힣]", t)]
+        if not toks:
+            return []
+        mem = getattr(self, "_fts_conn", None)
+        if mem is not None:
+            # 노트팩: 폴더 파싱 시 만든 인메모리 FTS가 zip의 fts.sqlite를 대체한다
+            try:
+                rows = mem.execute(
+                    "SELECT id, kind, bm25(docs) FROM docs WHERE docs MATCH ? "
+                    "ORDER BY bm25(docs) LIMIT ?",
+                    (" OR ".join(dict.fromkeys(self._fts_terms(toks))), k)).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+                self._lexical_receipt = {"status": "error: FTS 질의 실패", "hits": 0}
+            if rows:
+                self._lexical_receipt = {"status": "ok", "hits": len(rows)}
+            return [{"id": r[0], "kind": r[1], "bm25": round(r[2], 3)} for r in rows]
+        p = os.path.join(self.root, "lexical-index", "fts.sqlite")
+        if not os.path.exists(p):
+            p = os.path.join(self.root, "indexes", "lexical.sqlite")
+        if not os.path.exists(p):
+            self._lexical_receipt = {"status": "unavailable: lexical-index가 팩에 없음", "hits": 0}
+            return []
+        terms = self._fts_terms(toks)
         con = sqlite3.connect(p)
         # FTS 스키마는 팩 빌더마다 다르다: 구형은 (id, kind, body),
         # 신형은 (id, work_id, space, node_type, text). 없는 컬럼을 고정 참조하면
