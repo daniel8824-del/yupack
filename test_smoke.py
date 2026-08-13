@@ -47,21 +47,17 @@ def test_pack_ask_chain():
     assert "인수분해" in r["explanation"], r["explanation"]
 
 
-def test_pack_save_zip():
+def test_pack_save_notepack():
+    import os as _os
     from quality_fixture import fill_quality_floor
     fill_quality_floor(S, S.DEFAULT_PACK)
     r = S.pack_save()
-    # 기본 로컬 임베딩은 bge-m3다. OMLX가 꺼진 환경에서는 skipped도 정상 폴백이다.
-    assert r["embeddings"].startswith(("included(", "skipped")), r["embeddings"]
+    # zip 생산 폐기 (2026-08-13) — 산출은 옵시디언 노트팩 폴더. 임베딩은 qmd 소관.
+    assert r["format"] == "notepack", r
     assert r["counts"]["nodes"] == len(S.PACKS[S.DEFAULT_PACK]["nodes"])
-    # pack_save는 더 이상 download_url/_BUNDLES 번들을 만들지 않는다. 저장 경로를
-    # 사용자에게 묻고(ask_user) 구울 구조를 structure로 돌려준다.
-    # 계약 12항목이 실제로 생성되는지를 확인하는 편이 번들 검사보다 값어치가 있다.
-    need = ["nodes.jsonl", "edges.jsonl", "evidence.jsonl", "pack.yaml",
-            "integrity.json", "query-contract.json", "embeddings.json",
-            "lexical-index/fts.sqlite", "graph-index/adjacency.jsonl"]
-    missing = [n for n in need if n not in r["structure"]]
-    assert not missing, missing
+    assert _os.path.isdir(r["saved_to"])
+    assert _os.path.isfile(_os.path.join(r["saved_to"], r["moc"]))
+    assert _os.path.isfile(_os.path.join(r["saved_to"], "quality", "ledger.json"))
 
 
 def test_schema_pack_install():

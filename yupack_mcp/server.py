@@ -1063,7 +1063,8 @@ def _update_settings(**updates) -> dict:
 def _default_pack_path() -> str | None:
     try:
         path = _load_settings().get("default_pack")
-        if isinstance(path, str) and os.path.isfile(os.path.expanduser(path)):
+        # zip 파일(이행기 하위호환) 또는 노트팩 폴더 둘 다 기본 팩이 될 수 있다
+        if isinstance(path, str) and os.path.exists(os.path.expanduser(path)):
             return os.path.expanduser(path)
     except TypeError:
         pass
@@ -1878,21 +1879,234 @@ def pack_register_checks(questions: list[str], pack: str = DEFAULT_PACK,
             "stores": {"buffer": "ok", "sqlite": _persist(pack)}}
 
 
+def _qmd_register_folder(folder: str, name: str) -> dict:
+    """노트팩 폴더를 qmd 컬렉션으로 등록한다 (임베딩은 qmd 소관 — 오너 결정 D2)."""
+    import shutil as _sh
+    import subprocess
+    from . import local_pack
+    if local_pack.EMBED_MODEL != "qmd":
+        return {"registered": False,
+                "reason": f"임베딩 모드가 qmd가 아님({local_pack.EMBED_MODEL}) — 어휘·그래프로 동작"}
+    if not _sh.which("qmd"):
+        return {"registered": False, "reason": "qmd 미설치"}
+    try:
+        r = subprocess.run(["qmd", "collection", "show", name],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0 or name not in (r.stdout + r.stderr):
+            subprocess.run(["qmd", "collection", "add", folder, "--name", name],
+                           capture_output=True, text=True, timeout=60)
+        subprocess.run(["qmd", "update"], capture_output=True, text=True, timeout=300)
+        subprocess.run(["qmd", "embed", "-c", name], capture_output=True, text=True, timeout=600)
+        return {"registered": True, "collection": name}
+    except Exception as e:
+        return {"registered": False, "reason": str(e)[:120]}
+
+
+# 본문 섹션으로 렌더하는 필드 — frontmatter 스칼라 승격에서 제외
+_NOTE_TEXTY = {"label", "label_ko", "aliases_ko", "text", "statement", "definition",
+               "eli5", "mechanism", "interpretive_basis", "svo", "source_quote",
+               "extraction_note", "evidence_refs", "locator", "source_path",
+               "source_locator", "source_id"}
+_NOTE_FOLDER = {"Person": "person", "Deity": "deity", "Collective": "collective",
+                "Place": "place", "Object": "object", "Event": "event",
+                "Action": "action", "State": "state", "Process": "process",
+                "Claim": "claim", "Theme": "theme", "Topic": "theme",
+                "TextUnit": "evidence", "Evidence": "evidence", "Source": "source"}
+
+
+def _write_notepack(buf: dict, pack: str, note_dir: str, today: str) -> dict:
+    """버퍼를 옵시디언 노트팩(전 필드 템플릿)으로 펼친다 — 노트가 정본이다."""
+    from .local_pack import CAUSAL_RELS
+    nodes, edges = buf["nodes"], buf["edges"]
+
+    def label(nid):
+        p = nodes[nid].get("properties") or {}
+        return str(p.get("label_ko") or p.get("label") or nid).strip()
+
+    def fname(nid):
+        s = re.sub(r'[\\/:*?"<>|#^\[\]{}]', "-", label(nid))
+        return re.sub(r"\s+", " ", s).strip()[:80] or _safe_filename(nid)
+
+    fmap, seen = {}, {}
+    for nid in nodes:
+        f = fname(nid)
+        seen[f] = seen.get(f, 0) + 1
+        fmap[nid] = f if seen[f] == 1 else f"{f}-{seen[f]}"
+    out_edges: dict[str, list] = {}
+    for e in edges:
+        s, t = e.get("from_id"), e.get("to_id")
+        if s in nodes and t in nodes:
+            out_edges.setdefault(s, []).append((e.get("relation"), t))
+    count = 0
+    for nid, n in nodes.items():
+        p = n.get("properties") or {}
+        d = os.path.join(note_dir, _NOTE_FOLDER.get(n.get("node_type"), n.get("space") or "etc"))
+        os.makedirs(d, exist_ok=True)
+        aliases = p.get("aliases_ko") or []
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        L = ["---", f'title: "{label(nid)}"', "tags:", f"  - 독서팩/{pack}",
+             f"  - 프로젝트/{_safe_filename(pack)}-note-pack",
+             f"date: {today}", f"type: {n.get('node_type')}", f"node_id: {nid}"]
+        if aliases:
+            L.append("aliases:")
+            L += [f"  - {a}" for a in aliases[:8]]
+        for k, v in p.items():
+            if k in _NOTE_TEXTY or isinstance(v, (dict, list)) or v in (None, ""):
+                continue
+            sv = str(v)
+            L.append(f"{k}: " + (f'"{sv}"' if re.search(r'[:#\[\]{}"]', sv) else sv))
+        L += ["---", f"## {label(nid)}"]
+        if p.get("label") and p.get("label_ko") and p["label"] != p["label_ko"]:
+            L.append(f"*{p['label']}*")
+        L.append("")
+        body = p.get("text") or p.get("statement") or ""
+        if n.get("space") == "evidence":
+            if body:
+                L += ["> " + str(body).replace("\n", "\n> "), ""]
+            loc = p.get("locator")
+            if isinstance(loc, dict) and (loc.get("start_line") or loc.get("line_start")):
+                a = loc.get("start_line") or loc.get("line_start")
+                b = loc.get("end_line") or loc.get("line_end")
+                L.append(f"행:: {a}~{b}")
+            elif p.get("source_locator"):
+                L.append(f"위치: {p['source_locator']}")
+            if p.get("source_path"):
+                orig = os.path.splitext(os.path.basename(str(p["source_path"])))[0]
+                L.append(f"원문:: [[{orig}]]")
+            if p.get("extraction_note"):
+                L += ["", f"발췌 노트: {p['extraction_note']}"]
+            L.append("")
+        else:
+            if p.get("definition"):
+                L += [str(p["definition"]), ""]
+            if body and body != p.get("definition"):
+                L += [str(body), ""]
+            if p.get("eli5"):
+                L += [f"**쉽게 말하면:** {p['eli5']}", ""]
+            if p.get("interpretive_basis"):
+                L += [f"**해석 근거:** {p['interpretive_basis']}", ""]
+            if p.get("svo"):
+                L += [f"**구조(SVO):** {p['svo']}", ""]
+            if p.get("source_quote"):
+                L += ["> " + str(p["source_quote"]).replace("\n", "\n> "), ""]
+        refs = p.get("evidence_refs") or []
+        if refs:
+            L.append("### 근거")
+            L += [f"- 근거: [[{fmap[r]}]]" if r in fmap else f"- 근거: {r}" for r in refs[:10]]
+            L.append("")
+        rels = out_edges.get(nid) or []
+        if rels:
+            L.append("### 관계")
+            L += [f"{rel}:: [[{fmap[t]}]]" for rel, t in rels]
+            L.append("")
+        open(os.path.join(d, fmap[nid] + ".md"), "w", encoding="utf-8").write("\n".join(L))
+        count += 1
+    causal = [(e.get("from_id"), e.get("relation"), e.get("to_id")) for e in edges
+              if e.get("relation") in CAUSAL_RELS
+              and e.get("from_id") in nodes and e.get("to_id") in nodes]
+    used = sorted({e.get("relation") for e in edges if e.get("relation")})
+    claims = [nid for nid, n in nodes.items() if n.get("space") == "claim"]
+    themes = [nid for nid, n in nodes.items() if n.get("node_type") in ("Theme", "Topic")]
+    tcount: dict = {}
+    for n in nodes.values():
+        tcount[n.get("space")] = tcount.get(n.get("space"), 0) + 1
+    moc = ["---", f'title: "{pack} 노트팩 MOC"', "tags:", f"  - 독서팩/{pack}",
+           f"date: {today}", "type: MOC", "---", f"## {pack} — 노트팩", "",
+           f"노드 {len(nodes)} · 관계 {len(edges)} · 저작일 {today}", "",
+           "| 층 | 규모 |", "|---|---|",
+           f"| 개념(스키마) | {tcount.get('concept', 0)} |",
+           f"| 사건·행위(키네틱) | {tcount.get('kinetic', 0)} · 인과 화살표 {len(causal)} |",
+           f"| 주장·주제 | 주장 {len(claims)} · 주제 {len(themes)} |",
+           f"| 근거 | {tcount.get('evidence', 0)} |", ""]
+    if causal:
+        moc += ["## 키네틱 도미노", ""] + \
+               [f"- [[{fmap[s]}]] —{r}→ [[{fmap[t]}]]" for s, r, t in causal] + [""]
+    if claims:
+        moc += ["## 주장", ""] + [f"- [[{fmap[c]}]]" for c in claims] + [""]
+    moc += ["## 동사 범례", ""] + [f"- `{r}`" for r in used] + ["",
+            "## 걷는 법", "",
+            "\"왜?\"는 사건 노트의 `triggers::`/`results_in::` 링크를 따라간다.",
+            "역방향은 백링크 패널. 근거는 주장·사건 노트의 근거 링크와 백링크에서 연다."]
+    moc_name = f"{_safe_filename(pack)}-MOC.md"
+    open(os.path.join(note_dir, moc_name), "w", encoding="utf-8").write("\n".join(moc))
+    return {"count": count, "moc": moc_name}
+
+
+def _save_notepack(buf: dict, pack: str, authoring_quality: dict,
+                   save_to: str | None, overwrite: bool) -> dict:
+    """노트팩 저장: 게이트 통과한 버퍼 → 노트 폴더 + MOC + quality/ledger + qmd 등록.
+
+    G6는 만든 폴더를 노트팩 로더로 직접 다시 열어 실측한다 ('구운 뒤 열어서 확인').
+    실패하면 방금 만든 산출물을 제거한다 — 반쪽 팩을 볼트에 남기지 않는다.
+    """
+    import shutil as _sh
+    today = datetime.date.today().isoformat()
+    if os.environ.get("RAILWAY_PUBLIC_DOMAIN"):
+        return {"error": "노트팩 생성은 로컬 전용입니다 (zip 생산 폐기 — 서버 역할은 오너 결정 대기)."}
+    destination = save_to or PACK_DESTINATIONS.get(pack) or _load_settings().get("pack_dir")
+    if not destination:
+        return {"status": "needs_save_path",
+                "ask_user": "노트팩을 어느 폴더에 만들까요? 옵시디언 볼트의 팩 서가 경로를 알려주세요."}
+    base = os.path.expanduser(destination)
+    pack_root = os.path.join(base, _safe_filename(pack))
+    note_dir = os.path.join(pack_root, "note-pack")
+    if os.path.exists(note_dir) and not overwrite:
+        return {"status": "needs_overwrite_confirm", "note_dir": note_dir,
+                "ask_user": ("이미 같은 이름의 노트팩이 있습니다. 노트가 정본입니다 — 버퍼로 "
+                             "덮어쓰면 노트에서 고친 내용이 사라집니다. 덮어쓸까요?"),
+                "hint": "사용자가 승인하면 pack_save(..., overwrite=True)로 재호출하세요."}
+    if os.path.exists(note_dir):
+        _sh.rmtree(note_dir)
+    qa = _qa_scan(pack)
+    written = _write_notepack(buf, pack, note_dir, today)
+    heldout = _heldout_verify(note_dir, buf)
+    if heldout["failures"]:
+        _sh.rmtree(note_dir, ignore_errors=True)
+        return {"status": "needs_quality", "gate": "G6", "pack": pack, "heldout": heldout,
+                "next": ("실패한 질문이 grounded가 되도록 근거·주장을 보강하거나, 검수 질문을 "
+                         "실제 저작 내용에 맞게 pack_register_checks로 다시 등록한 뒤 재시도하세요. "
+                         "저장되지 않았습니다.")}
+    m = _quality_measure(buf)
+    ledger = _quality_ledger(m, _work_type(buf, m), heldout)
+    qdir = os.path.join(note_dir, "quality")
+    os.makedirs(qdir, exist_ok=True)
+    open(os.path.join(qdir, "ledger.json"), "w", encoding="utf-8").write(
+        json.dumps(ledger, ensure_ascii=False, indent=2))
+    qmd_c = _qmd_register_folder(note_dir, f"{_safe_filename(pack)}-note-pack")
+    result = {"format": "notepack", "saved_to": note_dir, "pack_folder": pack_root,
+              "counts": {"nodes": len(buf["nodes"]), "edges": len(buf["edges"]),
+                          "notes": written["count"]},
+              "moc": written["moc"], "authoring_quality": authoring_quality,
+              "qa_status": qa["status"], "qa_issues": qa["counts"]["issues"],
+              "qmd_collection": qmd_c,
+              "quality": {"odyssey_class_score": ledger["odyssey_class_score"],
+                          "gaps": ledger["gaps"],
+                          "canonical_grade": ledger["canonical_grade"],
+                          "work_type": ledger["work_type"],
+                          "heldout": f"{len(ledger['heldout']['results'])}문항 실측"},
+              "note": f"'{pack}' 노트팩을 만들었습니다: {note_dir} — 옵시디언에서 {written['moc']}를 여세요.",
+              "next_question": ("이 노트팩을 기본 팩으로 등록할까요? "
+                                 f"등록: pack_set_default(\"{note_dir}\")")}
+    if qa["status"] != "pass":
+        result["qa_warning"] = "그래머 위반이 있습니다. pack_qa로 확인 후 수정을 권장합니다."
+    return result
+
+
 @mcp.tool()
 def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
-              save_to: str | None = None) -> dict:
-    """현재 팩을 질의 가능 완성 zip으로 저장한다.
+              save_to: str | None = None, overwrite: bool = False) -> dict:
+    """현재 팩을 옵시디언 노트팩으로 저장한다 (zip 생산은 폐기됨 — 2026-08-13 오너 결정).
 
-    구조(표준 계약): pack.yaml + nodes/edges/evidence/reviews.jsonl + query-docs/ +
-    embeddings.json + lexical-index/ + vector-index/ + graph-index/ +
-    query-contract.json + integrity.json (+ runtime/, notes/).
-    이 zip은 pack_open_local로 열어 바로 질의할 수 있다.
+    산출: {서가}/{팩이름}/note-pack/ 폴더 — 타입별 노트(frontmatter 전 필드 +
+    `동사:: [[대상]]` 관계) + {팩이름}-MOC.md 허브 + quality/ledger.json.
+    저장 전 게이트(승격·커버리지·G1~G6)를 통과해야 하며, G6은 만든 폴더를 직접
+    다시 열어 검수 질문을 실측한다. 임베딩은 qmd 소관(컬렉션 자동 등록) —
+    include_embeddings 인자는 하위호환용으로 무시된다.
 
-    save_to: 저장할 폴더/파일 경로. 볼트 위치는 사람마다 다르므로 임의로 정하지 말고
-      **저장 전에 반드시 사용자에게 "압축파일을 어느 폴더에 저장할까요? (옵시디언 볼트의
-      팩 폴더 경로)"라고 물어서** 받은 경로를 save_to로 넘겨라. save_to가 비어 있으면
-      이 도구는 저장하지 않고 경로를 물으라는 안내(needs_save_path)를 반환한다.
-      서버(챗지피티) 모드에서는 디스크에 못 쓰므로 다운로드 링크를 준다.
+    save_to가 비어 있으면 설정 인터뷰의 팩 서가(pack_dir)를 쓰고, 그것도 없으면
+    needs_save_path로 사용자에게 묻는다. 같은 노트팩이 이미 있으면 덮어쓰지 않고
+    needs_overwrite_confirm을 반환한다 — 노트가 정본이다.
     """
     _ro = _read_only_block()
     if _ro:
@@ -1921,6 +2135,9 @@ def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
     save_gate = _quality_gate(buf, pack)
     if save_gate:
         return save_gate
+    # zip 생산 폐기 — 저장은 노트팩 폴더 생성으로 대체됐다.
+    # 아래 구 zip 파이프라인은 도달 불가이며 P4 정리에서 제거한다.
+    return _save_notepack(buf, pack, authoring_quality, save_to, overwrite)
     today = datetime.date.today().isoformat()
 
     # 1) 버퍼 -> 정본 5파일 (evidence 노드는 evidence.jsonl로도 승격)

@@ -228,7 +228,7 @@ class PromotionLifecycleTest(_PackTestCase):
                       buf["edges"])
         self.assertEqual([source_id],
                          buf["nodes"]["claim:identity-cost"]["properties"]["evidence_refs"])
-        self.assertTrue(os.path.isfile(saved["saved_to"]))
+        self.assertTrue(os.path.isdir(saved["saved_to"]))  # 노트팩 폴더가 산출물이다
 
     def test_promoted_kinetic_projects_records_not_supports(self):
         source_id = self._seed("사건팩", NARRATIVE_SOURCE)
@@ -258,7 +258,7 @@ class PromotionLifecycleTest(_PackTestCase):
 
         self.assertEqual("pass", quality["status"])
         self.assertEqual(0, quality["counts"]["kinetic"])
-        self.assertTrue(os.path.isfile(saved["saved_to"]))
+        self.assertTrue(os.path.isdir(saved["saved_to"]))  # 노트팩 폴더가 산출물이다
 
     def test_rejected_candidate_lives_only_in_draft_audit(self):
         source_id = self._seed("거부팩", NARRATIVE_SOURCE)
@@ -286,14 +286,23 @@ class PromotionLifecycleTest(_PackTestCase):
         from quality_fixture import fill_quality_floor
         fill_quality_floor(server, "불변팩")
         saved = server.pack_save("불변팩", include_embeddings=False)
-        before = hashlib.sha256(open(saved["saved_to"], "rb").read()).hexdigest()
+
+        def _tree(root):
+            h = hashlib.sha256()
+            for dp, _, fs in sorted(os.walk(root)):
+                for f in sorted(fs):
+                    h.update(f.encode())
+                    h.update(open(os.path.join(dp, f), "rb").read())
+            return h.hexdigest()
+
+        before = _tree(saved["saved_to"])
 
         server.authoring_register_candidate(
             "claim", "Claim", "claim:second", {"label": "둘째 주장"},
             source_id=source_id, pack="불변팩")
         server.authoring_reject("claim:second", pack="불변팩", reason="근거 없음")
 
-        after = hashlib.sha256(open(saved["saved_to"], "rb").read()).hexdigest()
+        after = _tree(saved["saved_to"])
         self.assertEqual(before, after)
 
 

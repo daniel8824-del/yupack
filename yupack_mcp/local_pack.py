@@ -658,7 +658,10 @@ class LocalPack:
         어휘(인메모리 FTS) + 벡터(qmd) + 그래프 3축 질의·거절·영수증 계약을 그대로 제공한다.
         읽기 전용 — 볼트 폴더 안에 어떤 파일도 만들지 않는다 (audit 기록도 끔).
         """
-        self.pack_id = os.path.basename(os.path.normpath(root))
+        base_name = os.path.basename(os.path.normpath(root))
+        parent = os.path.basename(os.path.dirname(os.path.normpath(root)))
+        # {book}/note-pack 배치에서 pack_id가 전부 'note-pack'으로 충돌하지 않게 부모를 붙인다
+        self.pack_id = f"{parent}-{base_name}" if base_name == "note-pack" and parent else base_name
         self.root = root
         self.cache = root
         self._no_audit = True

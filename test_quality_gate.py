@@ -72,6 +72,26 @@ def test_heldout_failure_blocks_save_g6():
         _fresh(pack)
 
 
+def test_notepack_overwrite_guard():
+    """노트가 정본이다 — 기존 노트팩을 묻지 않고 덮어쓰지 않는다."""
+    import os as _os
+    pack = "게이트덮어쓰기"
+    _fresh(pack)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            S.pack_create(pack, save_to=td)
+            fill_quality_floor(S, pack)
+            first = S.pack_save(pack, include_embeddings=False)
+            assert first["format"] == "notepack"
+            again = S.pack_save(pack, include_embeddings=False)
+            assert again["status"] == "needs_overwrite_confirm"
+            forced = S.pack_save(pack, include_embeddings=False, overwrite=True)
+            assert forced["format"] == "notepack"
+            assert _os.path.isdir(forced["saved_to"])
+    finally:
+        _fresh(pack)
+
+
 def test_floor_pack_saves_with_ledger_and_honest_score():
     pack = "게이트원장"
     _fresh(pack)
@@ -81,10 +101,11 @@ def test_floor_pack_saves_with_ledger_and_honest_score():
             fill_quality_floor(S, pack)
             saved = S.pack_save(pack, include_embeddings=False)
             assert "saved_to" in saved, saved
-            with zipfile.ZipFile(saved["saved_to"]) as z:
-                names = [n for n in z.namelist() if n.endswith("quality/ledger.json")]
-                assert names, "quality/ledger.json 미동봉"
-                ledger = json.loads(z.read(names[0]))
+            assert saved["format"] == "notepack"
+            import os as _os
+            lpath = _os.path.join(saved["saved_to"], "quality", "ledger.json")
+            assert _os.path.isfile(lpath), "quality/ledger.json 미동봉"
+            ledger = json.loads(open(lpath, encoding="utf-8").read())
             assert ledger["schema"] == "yupack.quality-ledger/v1"
             assert len(ledger["source_revision"]) == 16
             # 바닥 질량 팩은 오디세이급이 아니다 — 점수·공백이 정직하게 낮게 찍힌다

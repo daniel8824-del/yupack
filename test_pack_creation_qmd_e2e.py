@@ -66,10 +66,12 @@ def test_full_pack_creation_with_qmd_embeddings(monkeypatch):
             from quality_fixture import fill_quality_floor
             fill_quality_floor(S, pack)
 
-            # ④ 저장 (임베딩 포함 요청 — qmd 모드는 런타임 컬렉션 계약)
+            # ④ 저장 — 산출은 노트팩 폴더 (zip 폐기, 임베딩은 qmd 소관: 컬렉션 자동 등록)
             saved = S.pack_save(pack, include_embeddings=True)
+            assert saved["format"] == "notepack", saved
             path = Path(saved["saved_to"])
-            assert path.is_file() and "-pack-final-" in path.name
+            assert path.is_dir() and path.name == "note-pack"
+            registered = (saved.get("qmd_collection") or {}).get("collection")
             # 인터뷰에서 고른 서랍 아래(작품 폴더 포함)에만 저장한다
             assert Path(td) in path.parents
 
@@ -95,6 +97,7 @@ def test_full_pack_creation_with_qmd_embeddings(monkeypatch):
     finally:
         S.PACKS.pop(pack, None)
         S.PACK_DESTINATIONS.pop(pack, None)
-        if qmd_collection:
-            subprocess.run(["qmd", "collection", "remove", qmd_collection],
-                           capture_output=True, text=True, timeout=30)
+        for col in (qmd_collection, locals().get("registered")):
+            if col:
+                subprocess.run(["qmd", "collection", "remove", col],
+                               capture_output=True, text=True, timeout=30)

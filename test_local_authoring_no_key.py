@@ -46,11 +46,10 @@ def test_no_key_authoring_saves_final_zip_and_reopens_queryable():
         S.authoring_promote("claim:memory", pack="무키생성", evidence_ids=["ev:memory"])
         fill_quality_floor(S, "무키생성")
         saved = S.pack_save("무키생성", include_embeddings=False)
+        assert saved["format"] == "notepack", saved
         path = Path(saved["saved_to"])
-        assert path.name.startswith("무키생성-pack-final-")
-        assert path.is_file()
-        listed = S.pack_list_local(td)
-        assert str(path) in listed["verified_final_packs"]
+        assert path.is_dir() and path.name == "note-pack"
+        assert (path / saved["moc"]).is_file()
         answer = LocalPack(str(path)).ask("기억은 무엇을 보존하나?")
         assert answer["status"] == "grounded"
         assert answer["direct_evidence"][0]["evidence_id"] == "ev:memory"
