@@ -1026,21 +1026,113 @@ def _settings_path() -> Path:
     return Path(os.path.expanduser(raw)) if raw else Path.home() / ".yupack" / "settings.json"
 
 
+def _load_settings() -> dict:
+    try:
+        data = json.loads(_settings_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _update_settings(**updates) -> dict:
+    """부분 갱신 (기존 키 보존). 한 키 저장이 다른 키를 지우면 안 된다."""
+    data = {**_load_settings(), **updates}
+    path = _settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return data
+
+
 def _default_pack_path() -> str | None:
     try:
-        path = json.loads(_settings_path().read_text(encoding="utf-8")).get("default_pack")
+        path = _load_settings().get("default_pack")
         if isinstance(path, str) and os.path.isfile(os.path.expanduser(path)):
             return os.path.expanduser(path)
-    except (OSError, json.JSONDecodeError, TypeError):
+    except TypeError:
         pass
     return None
 
 
 def _save_default_pack_path(zip_path: str) -> None:
-    settings = _settings_path()
-    settings.parent.mkdir(parents=True, exist_ok=True)
-    settings.write_text(json.dumps({"default_pack": zip_path}, ensure_ascii=False, indent=2) + "\n",
-                        encoding="utf-8")
+    _update_settings(default_pack=zip_path)
+
+
+def _embed_backend_options() -> list[dict]:
+    """이 컴퓨터에서 지금 실제로 응답하는 임베딩 백엔드만 선택지로 만든다.
+
+    죽어 있는 백엔드는 나열하지 않는다 (OMLX 설치 권유도 하지 않는다 —
+    "서버 없는 로컬" 배포 약속과 충돌한다). 어휘+그래프는 항상 마지막 선택지다.
+    """
+    from . import local_pack
+    opts = []
+    if local_pack.omlx_alive():
+        opts.append({"embed_model": "bge-m3", "dimension": 1024,
+                     "note": "로컬 OMLX 서버가 지금 응답함 (제작·고급 환경 권장)"})
+    if local_pack._qmd_available():
+        opts.append({"embed_model": "qmd", "dimension": 768,
+                     "note": "qmd 설치됨 — 키·비용 없는 로컬 임베딩 (수강 환경 권장)"})
+    opts.append({"embed_model": "none", "dimension": 0,
+                 "note": "벡터 없이 어휘+그래프 검색만 (추가 설치 0)"})
+    return opts
+
+
+def _setup_gate() -> dict | None:
+    """작업 진입 게이트: 미설정 → 인터뷰, 저장 백엔드 사망 → 재질문, 오늘 첫 작업 → 확인.
+
+    조용한 백엔드 전환은 하지 않는다 — 어긋나면 반드시 사용자에게 묻는다.
+    통과하면 None. 안정화 기간에는 하루 첫 작업마다 확인한다 (confirm_interval=never로 해제).
+    """
+    from . import local_pack
+    s = _load_settings()
+    env_model = os.environ.get("YUPACK_EMBED_MODEL")
+    env_dir = os.environ.get("YUPACK_PACK_DIR")
+    model = env_model or s.get("embed_model")
+    pack_dir = s.get("pack_dir") or env_dir
+
+    if not model or not pack_dir:
+        return {
+            "status": "needs_setup",
+            "ask_user": ("유팩 첫 설정이 필요합니다. 아래 두 가지를 사용자에게 그대로 물어보세요. "
+                         "① 팩 zip을 보관할 폴더 (folder_candidates 중 선택 또는 직접 입력) "
+                         "② 임베딩 방식 (embed_options 중 선택 — 이 컴퓨터에서 지금 되는 것만 나열함)"),
+            "folder_candidates": _discover_pack_dirs(),
+            "embed_options": _embed_backend_options(),
+            "next": "답을 받으면 pack_configure(pack_dir=..., embed_model=...)로 저장하세요. "
+                    "값을 추측하거나 질문을 건너뛰지 마세요.",
+        }
+
+    if model == "bge-m3" and not local_pack.omlx_alive():
+        return {
+            "status": "saved_backend_unreachable", "saved_model": "bge-m3",
+            "ask_user": ("저장된 임베딩 백엔드(bge-m3, 로컬 OMLX)가 지금 응답하지 않습니다. "
+                         "아래 embed_options 중 어떤 방식으로 진행할지 사용자에게 물어보세요."),
+            "embed_options": _embed_backend_options(),
+            "next": "조용히 다른 백엔드로 바꾸지 않습니다. 사용자가 고른 값을 "
+                    "pack_configure(embed_model=...)로 저장하세요. OMLX를 다시 켰다면 그대로 재시도하면 됩니다.",
+        }
+    if model == "qmd" and not local_pack._qmd_available():
+        return {
+            "status": "saved_backend_unreachable", "saved_model": "qmd",
+            "ask_user": "저장된 임베딩 백엔드(qmd)가 이 컴퓨터에 없습니다. 어떤 방식으로 진행할지 물어보세요.",
+            "embed_options": _embed_backend_options(),
+            "next": "사용자가 고른 값을 pack_configure(embed_model=...)로 저장하세요.",
+        }
+
+    if env_model and env_dir and not s.get("embed_model"):
+        return None  # env로 완전 고정된 배포·테스트 환경은 일일 확인 대상이 아니다
+
+    today = datetime.date.today().isoformat()
+    if s.get("confirm_interval", "daily") == "daily" and s.get("last_confirmed") != today:
+        dim = {"bge-m3": 1024, "qmd": 768, "none": 0}.get(model)
+        return {
+            "status": "needs_daily_confirm",
+            "current": {"pack_dir": pack_dir, "embed_model": model, "dimension": dim},
+            "ask_user": (f"오늘 첫 유팩 작업입니다. 현재 설정 — 팩 폴더: {pack_dir} · "
+                         f"임베딩: {model}. 이대로 진행할까요? (안정화 기간 동안 하루 한 번 확인합니다)"),
+            "next": "사용자가 예라고 하면 pack_configure(confirm=True), 바꾸겠다고 하면 바꿀 값만 담아 "
+                    "pack_configure(...)를 호출하세요. 사용자에게 묻지 않고 확인 처리하지 마세요.",
+        }
+    return None
 
 
 def _is_final_pack_path(path: str) -> bool:
@@ -1086,7 +1178,11 @@ def _verified_final_pack_paths(directory: str) -> list[str]:
 def _open_verified_final_library() -> dict:
     """정본 하나면 열고, 여러 작품이면 잘못 고르지 않고 선택 정보를 돌려준다."""
     global _AUTO_OPENED
-    candidates = _discover_pack_dirs()
+    configured = _load_settings().get("pack_dir") or os.environ.get("YUPACK_PACK_DIR")
+    if configured and os.path.isdir(os.path.expanduser(configured)):
+        candidates = [os.path.expanduser(configured)]
+    else:
+        candidates = _discover_pack_dirs()
     if not candidates:
         _AUTO_OPENED = {"error": "정본 팩 서랍을 자동 탐색하지 못했습니다."}
         return _AUTO_OPENED
@@ -1156,6 +1252,9 @@ def _discover_pack_dirs() -> list[str]:
         # iCloud Obsidian
         os.path.join(home, "Library", "Mobile Documents", "iCloud~md~obsidian",
                      "Documents", "*", "70_Ontology"),
+        # iCloud Drive(CloudDocs) 아래 볼트 (실사용 보고: Learning Core/70_Ontology)
+        os.path.join(home, "Library", "Mobile Documents", "com~apple~CloudDocs",
+                     "*", "70_Ontology"),
         # 볼트 이름을 안 쓰는 사람들: 홈 아래 yupack 전용 서랍
         os.path.join(home, "yupack-packs"),
         os.path.join(home, ".local", "share", "yupack", "packs"),
@@ -1177,8 +1276,11 @@ def pack_list_local(directory: str = "") -> dict:
     설정이 없어도 동작하며, 못 찾으면 사용자에게 물을 문구를 돌려준다.
     경로를 모를 때는 이 도구부터 호출하면 된다.
     """
+    gate = _setup_gate()
+    if gate:
+        return gate
     import glob as _glob
-    d = directory or os.environ.get("YUPACK_PACK_DIR") or ""
+    d = directory or _load_settings().get("pack_dir") or os.environ.get("YUPACK_PACK_DIR") or ""
     if d:
         d = os.path.expanduser(d)
     else:
@@ -1218,6 +1320,9 @@ def pack_open_local(zip_path: str, mode: str = "read_only") -> dict:
       ontology_add_node/pack_qa/pack_save를 반환된 authoring_pack 이름으로 호출하면
       이어서 편집·검사·재저장할 수 있다. (핸들 id는 저작 버퍼가 아니다 - 혼용 금지)
     """
+    gate = _setup_gate()
+    if gate:
+        return gate
     from . import local_pack
     try:
         r = local_pack.open_local(zip_path, "read_only")
@@ -1250,6 +1355,9 @@ def pack_ask_local(question: str, pack_handle: str = "", top_k: int = 6) -> dict
     retrieval_trace를 반환하며 근거가 없으면 no_local_evidence를 반환한다.
     pack_handle을 생략하면 열린 팩을 쓰며, 정본이 하나뿐이면 자동으로 연다.
     에이전트 개발·MCP·메모리·프롬프트 인젝션·회귀 질문이면 답하기 전에 먼저 호출할 것."""
+    gate = _setup_gate()
+    if gate:
+        return gate
     from . import local_pack
     if pack_handle:
         pk = local_pack.get(pack_handle)
@@ -1292,6 +1400,59 @@ def pack_set_default(zip_path: str) -> dict:
 
 
 @mcp.tool()
+def pack_configure(pack_dir: str = "", embed_model: str = "", confirm: bool = False,
+                   confirm_interval: str = "") -> dict:
+    """유팩 사용자 설정을 저장·확인한다 (~/.yupack/settings.json).
+
+    needs_setup·needs_daily_confirm·saved_backend_unreachable 응답을 받으면 사용자에게
+    그 질문을 그대로 물은 뒤, 받은 답만 이 도구로 저장한다. 값을 추측하지 않는다.
+    confirm=True는 "오늘 이 설정 그대로 진행"의 확인 스탬프다.
+    confirm_interval: daily(안정화 기간 기본, 하루 한 번 확인) 또는 never(확인 해제).
+    인자 없이 부르면 현재 설정·게이트 상태만 돌려준다.
+    """
+    from . import local_pack
+    updates: dict = {}
+    if pack_dir:
+        d = os.path.expanduser(pack_dir)
+        if not os.path.isdir(d):
+            return {"error": f"폴더가 없습니다: {d}",
+                    "hint": "실제 존재하는 폴더 경로인지 사용자에게 다시 확인하세요."}
+        updates["pack_dir"] = d
+    if embed_model:
+        if embed_model == "bge-m3" and not local_pack.omlx_alive():
+            return {"error": "bge-m3(로컬 OMLX)가 지금 응답하지 않습니다.",
+                    "embed_options": _embed_backend_options(),
+                    "hint": "지금 되는 선택지 중에서 고르거나, OMLX를 켠 뒤 다시 저장하세요."}
+        if embed_model == "qmd" and not local_pack._qmd_available():
+            return {"error": "qmd가 이 컴퓨터에 설치돼 있지 않습니다.",
+                    "embed_options": _embed_backend_options()}
+        if embed_model not in {"bge-m3", "qmd", "none"} and not embed_model.startswith("text-embedding"):
+            return {"error": f"모르는 임베딩 방식: {embed_model}",
+                    "embed_options": _embed_backend_options()}
+        updates["embed_model"] = embed_model
+    if confirm_interval:
+        if confirm_interval not in {"daily", "never"}:
+            return {"error": "confirm_interval은 daily 또는 never만 됩니다."}
+        updates["confirm_interval"] = confirm_interval
+    if not updates and not confirm:
+        return {"settings": _load_settings(), "effective_model": local_pack.EMBED_MODEL,
+                "dimension": local_pack.EMBED_DIM, "embed_options": _embed_backend_options(),
+                "gate": _setup_gate() or {"status": "ok"}}
+    updates["last_confirmed"] = datetime.date.today().isoformat()
+    saved = _update_settings(**updates)
+    model, dim = local_pack.refresh_embed_model()
+    out = {"ok": True,
+           "settings": {k: saved.get(k) for k in
+                        ("pack_dir", "embed_model", "confirm_interval", "last_confirmed", "default_pack")},
+           "effective_model": model, "dimension": dim}
+    env_model = os.environ.get("YUPACK_EMBED_MODEL")
+    if env_model and saved.get("embed_model") and env_model != saved.get("embed_model"):
+        out["warning"] = (f"환경변수 YUPACK_EMBED_MODEL={env_model}이 설정을 덮고 있습니다. "
+                          "플러그인/환경 정의에서 제거해야 저장값이 적용됩니다.")
+    return out
+
+
+@mcp.tool()
 def pack_create(pack: str, save_to: str | None = None) -> dict:
     """새 팩 버퍼를 만든다 (이후 add_node/ingest/extract로 채우고 pack_save로 내보낸다).
 
@@ -1299,9 +1460,15 @@ def pack_create(pack: str, save_to: str | None = None) -> dict:
     임의로 만들지 않고 물어볼 문구를 반환한다. 같은 이름이 이미 있으면 오류가 아니라
     현황을 돌려준다 (이어서 작업 가능).
     """
+    gate = _setup_gate()
+    if gate:
+        return gate
     _ro = _read_only_block()
     if _ro:
         return _ro
+    if not save_to:
+        # 설정 인터뷰에서 사용자가 이미 고른 팩 서랍이 있으면 그것이 기본 저장처다
+        save_to = _load_settings().get("pack_dir") or ""
     if not save_to:
         return {
             "status": "needs_save_path",
@@ -1330,6 +1497,9 @@ def pack_ingest_local_zip(zip_path: str, pack: str = DEFAULT_PACK,
     pack_authoring_sources로 원문을 읽고 Claim·Concept·Kinetic·관계를 작성한다.
     pack_authoring_complete 전에는 pack_save가 ZIP 생성을 거절한다.
     """
+    gate = _setup_gate()
+    if gate:
+        return gate
     _ro = _read_only_block()
     if _ro:
         return _ro

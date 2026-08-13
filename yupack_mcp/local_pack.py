@@ -24,25 +24,59 @@ BGE_CACHE_DIR = os.path.expanduser(
     os.environ.get("YUPACK_BGE_CACHE_DIR", "~/.cache/yupack/bge-m3"))
 
 # 기본 임베딩 계약은 로컬 OMLX bge-m3(1024d)다. API 키는 필요 없다.
-# QMD는 볼트 검색 도구이며, Yupack에서는 명시적 호환 모드(YUPACK_EMBED_MODEL=qmd)
-# 로만 쓴다. 키가 없다는 이유로 QMD로 자동 전환하면 팩의 저장 벡터 계약이 바뀌므로 금지한다.
+# QMD는 볼트 검색 도구이며, Yupack에서는 사용자가 고른 호환 모드(YUPACK_EMBED_MODEL=qmd
+# 또는 settings.json embed_model=qmd)로만 쓴다. 백엔드 자동 전환은 팩의 저장 벡터 계약을
+# 조용히 바꾸므로 금지한다. 백엔드가 죽으면 서버의 설정 게이트가 사용자에게 다시 묻는다.
 def _qmd_available() -> bool:
     import shutil
     return shutil.which("qmd") is not None
 
 
+def settings_file() -> str:
+    raw = os.environ.get("YUPACK_SETTINGS")
+    return os.path.expanduser(raw) if raw else os.path.expanduser("~/.yupack/settings.json")
+
+
+def _settings_embed_model() -> str | None:
+    try:
+        with open(settings_file(), encoding="utf-8") as f:
+            v = json.load(f).get("embed_model")
+        return v if isinstance(v, str) and v else None
+    except (OSError, ValueError):
+        return None
+
+
 def _pick_model() -> tuple[str, int]:
-    forced = os.environ.get("YUPACK_EMBED_MODEL")
+    forced = os.environ.get("YUPACK_EMBED_MODEL") or _settings_embed_model()
     if forced == "bge-m3":
         return "bge-m3", 1024
     if forced == "qmd":
         return "qmd", 768
+    if forced == "none":  # 벡터 없이 어휘+그래프만 (설정 인터뷰에서 사용자가 고른 값)
+        return "none", 0
     if forced:
         return forced, {"text-embedding-3-large": 3072, "text-embedding-3-small": 1536}.get(forced, 1536)
     return "bge-m3", 1024
 
 
 EMBED_MODEL, EMBED_DIM = _pick_model()
+
+
+def refresh_embed_model() -> tuple[str, int]:
+    """설정 변경을 프로세스 재시작 없이 반영한다 (pack_configure·팩 열기 시점에 호출)."""
+    global EMBED_MODEL, EMBED_DIM
+    EMBED_MODEL, EMBED_DIM = _pick_model()
+    return EMBED_MODEL, EMBED_DIM
+
+
+def omlx_alive(timeout: float = 0.6) -> bool:
+    """로컬 OMLX 임베딩 서버 생존 확인 (설정 게이트가 선택지·재질문 판정에 쓴다)."""
+    base = EMBED_URL.rsplit("/embeddings", 1)[0]
+    try:
+        urllib.request.urlopen(f"{base}/models", timeout=timeout)
+        return True
+    except Exception:
+        return False
 
 # 인과 축 (2026-08-12): "왜" 계열 질문은 방향을 보존한 인과 확장 + Claim 투영이 필요하다.
 # 배관 관계(contains/contains_segment)는 원문 분할 구조라 인과 확장에서 제외한다.
@@ -89,6 +123,8 @@ def _sha256(data: bytes) -> str:
 
 def _embed(texts: list[str], model: str | None = None) -> list[list[float]] | None:
     model = model or EMBED_MODEL
+    if model == "none":
+        return None
     try:
         if model.startswith("text-embedding"):
             key = os.environ.get("OPENAI_API_KEY")
@@ -220,6 +256,7 @@ def _norm_evidence(e: dict) -> dict:
 def build_queryable(source_zip: str, out_zip: str | None = None,
                     include_embeddings: bool = True) -> dict:
     """정본 zip(nodes/edges/evidence/reviews)을 계약 구조의 질의 가능 zip으로 재구성한다."""
+    refresh_embed_model()
     source_zip = os.path.expanduser(source_zip)
     z = zipfile.ZipFile(source_zip)
     names = [n for n in z.namelist() if "__MACOSX" not in n and "__pycache__" not in n
@@ -1212,6 +1249,7 @@ class LocalPack:
 
 # ======================= 핸들 관리 =======================
 def open_local(zip_path: str, mode: str = "read_only") -> dict:
+    refresh_embed_model()
     pk = LocalPack(zip_path, mode)
     handle = f"pack_{pk.manifest_hash[:8]}"
     _HANDLES[handle] = pk
