@@ -2094,6 +2094,54 @@ def _save_notepack(buf: dict, pack: str, authoring_quality: dict,
 
 
 @mcp.tool()
+def pack_migrate_to_notes(zip_path: str, dest_dir: str = "", overwrite: bool = False) -> dict:
+    """기존 zip 정본을 옵시디언 노트팩으로 이행한다. zip은 보존한다 (이행기 하위호환 D1).
+
+    게이트 없이 충실 복제한다: 노드·엣지·근거·품질 문서를 그대로 노트로 펼친다
+    (이행은 기존 정본의 형식 전환이지 신규 저작이 아니다). dest_dir 생략 시
+    zip이 있는 폴더(책 폴더) 아래 note-pack/을 만든다. 이행 후 폴더를 다시 열어
+    노드 수 일치를 실측한다.
+    """
+    import shutil as _sh
+    from . import local_pack
+    zp = os.path.expanduser(zip_path)
+    if not os.path.isfile(zp):
+        return {"error": f"zip이 없습니다: {zp}"}
+    lp = local_pack.LocalPack(zp)
+    edges = []
+    for src, lst in lp.adj.items():
+        for rel, dst in lst:
+            if not str(rel).startswith("~"):
+                edges.append({"from_id": src, "relation": rel, "to_id": dst})
+    buf_like = {"nodes": lp.nodes, "edges": edges}
+    book_dir = os.path.expanduser(dest_dir) if dest_dir else os.path.dirname(zp)
+    note_dir = os.path.join(book_dir, "note-pack")
+    if os.path.exists(note_dir) and not overwrite:
+        return {"status": "needs_overwrite_confirm", "note_dir": note_dir,
+                "hint": "이미 노트팩이 있습니다. 노트가 정본이면 이행이 필요 없습니다. "
+                        "정말 다시 펼치려면 overwrite=True로 재호출하세요."}
+    if os.path.exists(note_dir):
+        _sh.rmtree(note_dir)
+    pack_name = os.path.basename(book_dir) or lp.pack_id
+    today = datetime.date.today().isoformat()
+    written = _write_notepack(buf_like, pack_name, note_dir, today)
+    qdocs = lp._quality_docs()
+    if qdocs:
+        qdir = os.path.join(note_dir, "quality")
+        os.makedirs(qdir, exist_ok=True)
+        for rel, doc in qdocs.items():
+            open(os.path.join(qdir, os.path.basename(rel)), "w", encoding="utf-8").write(
+                json.dumps(doc, ensure_ascii=False, indent=2))
+    reopened = local_pack.LocalPack(note_dir)
+    return {"format": "notepack", "migrated_from": zp, "saved_to": note_dir,
+            "counts": {"zip_nodes": len(lp.nodes), "note_nodes": len(reopened.nodes),
+                        "notes": written["count"], "quality_docs": len(qdocs)},
+            "faithful": len(reopened.nodes) == len(lp.nodes),
+            "moc": written["moc"],
+            "note": "zip은 보존됩니다 (읽기 하위호환). 이행 후 정본은 노트팩입니다."}
+
+
+@mcp.tool()
 def pack_save(pack: str = DEFAULT_PACK, include_embeddings: bool = True,
               save_to: str | None = None, overwrite: bool = False) -> dict:
     """현재 팩을 옵시디언 노트팩으로 저장한다 (zip 생산은 폐기됨 — 2026-08-13 오너 결정).

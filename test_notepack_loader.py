@@ -84,6 +84,47 @@ def test_notepack_frontmatter_edgecases(tmp_path, monkeypatch):
     assert list(lp.nodes) == ["topic:1"]  # MOC·무프론트매터 문서는 노드가 아니다
 
 
+def test_migrate_zip_to_notepack(tmp_path, monkeypatch):
+    """P3: 기존 zip 정본 → 노트팩 충실 이행 (zip 보존, 노드 수 일치 실측)."""
+    import json
+    import zipfile
+    import yupack_mcp.server as S
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+    refresh_embed_model()
+    nodes = [
+        {"id": "per:a", "space": "concept", "node_type": "Person",
+         "properties": {"label": "인물 A", "text": "설명"}},
+        {"id": "ev:1", "space": "evidence", "node_type": "TextUnit",
+         "properties": {"label": "근거 1", "text": "근거 본문", "source_locator": "1행"}},
+        {"id": "claim:1", "space": "claim", "node_type": "Claim",
+         "properties": {"label": "주장 1", "text": "주장", "evidence_refs": ["ev:1"]}},
+    ]
+    edges = [{"source": "ev:1", "target": "claim:1", "relation": "supports", "properties": {}},
+             {"source": "ev:1", "target": "per:a", "relation": "describes", "properties": {}}]
+    book = tmp_path / "테스트책"
+    book.mkdir()
+    src = book / "테스트책-pack-final-2026-08-13.zip"
+    with zipfile.ZipFile(src, "w") as z:
+        z.writestr("nodes.jsonl", "\n".join(json.dumps(n, ensure_ascii=False) for n in nodes))
+        z.writestr("edges.jsonl", "\n".join(json.dumps(e, ensure_ascii=False) for e in edges))
+        z.writestr("evidence.jsonl", json.dumps(
+            {"evidence_id": "ev:1", "summary": "근거 본문", "source_locator": "1행"},
+            ensure_ascii=False))
+        z.writestr("reviews.jsonl", "")
+        z.writestr("quality/finalization.json", json.dumps({"checks": {"unique_nodes": True}}))
+    r = S.pack_migrate_to_notes(str(src))
+    assert r["format"] == "notepack" and r["faithful"] is True, r
+    assert r["counts"]["zip_nodes"] == r["counts"]["note_nodes"] == 3
+    assert os.path.isfile(os.path.join(r["saved_to"], "quality", "finalization.json"))
+    assert os.path.isfile(src)  # zip 보존 (이행기 하위호환)
+    lp = LocalPack(r["saved_to"])
+    ans = lp.ask("근거 본문은 무엇을 말하나?", 3)
+    assert ans["status"] == "grounded"
+    # 재이행은 묻지 않고 덮지 않는다
+    again = S.pack_migrate_to_notes(str(src))
+    assert again["status"] == "needs_overwrite_confirm"
+
+
 @pytest.mark.skipif(
     not glob.glob("/Users/yedulab/Zettelkasten/70_Ontology/odyssey-butler/note-pack"),
     reason="파일럿 노트팩 없음")
