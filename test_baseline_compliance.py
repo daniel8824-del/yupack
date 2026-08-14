@@ -237,11 +237,14 @@ def test_t1_preserves_both_quality_files_and_t6_mode(tmp_path, monkeypatch):
 
 
 def test_existing_final_packs_no_false_tamper(monkeypatch):
-    """기존 팩을 깨뜨리는 구현은 실패다 — 전수에서 예외 0 + 거짓 조작 판정 0.
+    """기존 팩을 깨뜨리는 구현은 실패다 — 전수에서 예외 0 + 기준 세트 거짓 조작 판정 0.
 
-    정직하게 하한을 미달한 팩(예: 증보 웨이브의 수리 라운드 중간물)이 below_baseline으로
-    떨어지는 것은 도구가 제 일을 한 것이다 — 그건 허용하고, declared_mismatch(조작 판정)가
-    실팩에서 나오면 재계산기의 오탐이므로 실패로 본다.
+    오탐 0을 단정하는 범위는 재계산기 제정(2026-08-13) 이전에 봉인된 기준 세트
+    (2026-08-12 finals)다. 그 이후 함대가 새로 봉인하는 팩(r2 등)은 선언이 실제로
+    어긋날 수 있고(실사례: 앤 r2 grammar_kinds 25≠14 · per_1000 분모 상이,
+    일리아스 r2 kinetic/claim 19노드 분류 스왑 — 2026-08-13 실측) 그건 게이트가
+    제 일을 한 것이다 — findings로 출력만 하고 실패로 보지 않는다. below_baseline
+    (정직한 미달)은 어느 쪽이든 허용.
     """
     monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
     paths = sorted(p for p in glob.glob(
@@ -249,16 +252,18 @@ def test_existing_final_packs_no_false_tamper(monkeypatch):
         if "_archive" not in p)
     if not paths:
         pytest.skip("정본 팩 없음")
-    false_tamper, honest_fails = [], []
+    false_tamper, fleet_findings = [], []
     for p in paths:
         v = LocalPack(p).verify_baseline()  # 예외가 나면 그 자체로 실패
         if v["status"] == "FAIL" and v["reason"] == "declared_mismatch":
-            false_tamper.append((os.path.basename(p),
-                                 [m["check"] for m in v["mismatches"]][:3]))
-        elif v["status"] == "FAIL":
-            honest_fails.append((os.path.basename(p), v["below_baseline"][:3]))
+            item = (os.path.basename(p), [m["check"] for m in v["mismatches"]][:3])
+            if "-2026-08-12" in p:      # 기준 세트: 여기서 조작 판정 = 재계산기 오탐
+                false_tamper.append(item)
+            else:                        # 이후 봉인분: 게이트 적발 — 저작 레인 인계 대상
+                fleet_findings.append(item)
     assert not false_tamper, false_tamper
-    # 정직한 미달은 정보로만 (증보 중간물 등) — 존재 자체는 실패가 아니다
+    if fleet_findings:
+        print("\n[인계] 신규 봉인 팩 선언 불일치 (북팩 레인 재날인 대상):", fleet_findings)
 
 
 # ── 게이트9 + suspect + 봉인 (발주 2026-08-13: prompt-yupack-authoring-quality-gates) ──
