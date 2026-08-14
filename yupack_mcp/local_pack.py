@@ -811,7 +811,10 @@ class LocalPack:
         self.reviews = {}
         self.vec_meta, self.vecs = [], b""
         self.embed_model, self.dim = EMBED_MODEL, EMBED_DIM
-        con = sqlite3.connect(":memory:")
+        # 인메모리 FTS는 커넥션당 하나뿐이라 재생성이 불가 — 스레드 공유를 허용하되
+        # 잠금으로 직렬화한다 (HTTP 모드·병렬 호출에서 크래시 실측, 2026-08-13).
+        import threading
+        con = sqlite3.connect(":memory:", check_same_thread=False)
         con.execute("CREATE VIRTUAL TABLE docs USING fts5(id, kind, text)")
         for nid, nd in self.nodes.items():
             p = nd["properties"]
@@ -820,6 +823,7 @@ class LocalPack:
             con.execute("INSERT INTO docs VALUES(?,?,?)", (nid, nd["node_type"], doc))
         con.commit()
         self._fts_conn = con
+        self._fts_lock = threading.Lock()
 
     @staticmethod
     def _parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -1254,10 +1258,11 @@ class LocalPack:
         if mem is not None:
             # 노트팩: 폴더 파싱 시 만든 인메모리 FTS가 zip의 fts.sqlite를 대체한다
             try:
-                rows = mem.execute(
-                    "SELECT id, kind, bm25(docs) FROM docs WHERE docs MATCH ? "
-                    "ORDER BY bm25(docs) LIMIT ?",
-                    (" OR ".join(dict.fromkeys(self._fts_terms(toks))), k)).fetchall()
+                with self._fts_lock:
+                    rows = mem.execute(
+                        "SELECT id, kind, bm25(docs) FROM docs WHERE docs MATCH ? "
+                        "ORDER BY bm25(docs) LIMIT ?",
+                        (" OR ".join(dict.fromkeys(self._fts_terms(toks))), k)).fetchall()
             except sqlite3.OperationalError:
                 rows = []
                 self._lexical_receipt = {"status": "error: FTS 질의 실패", "hits": 0}
