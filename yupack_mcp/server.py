@@ -893,9 +893,16 @@ def _hydrate_from_zip(zip_path: str, pack: str | None = None) -> dict:
             return {"error": f"저작 버퍼 '{pack}'에 이미 노드 {len(buf['nodes'])}개가 있습니다. "
                             "덮어쓰지 않습니다. pack 파라미터로 다른 이름을 지정하세요."}
         for nid, node in lp.nodes.items():
+            props = dict(node.get("properties") or {})
+            # 범위형 locator(행::)는 로더가 evidence 테이블에만 실으므로, 이어편집
+            # 버퍼의 properties로 병합해야 재저장이 G2(locator 누락)에 안 막힌다.
+            if node.get("space") == "evidence" and not props.get("source_locator"):
+                ev_loc = (lp.evidence.get(nid) or {}).get("source_locator")
+                if ev_loc:
+                    props["source_locator"] = ev_loc
             buf["nodes"][nid] = {
                 "space": node.get("space"), "node_type": node.get("node_type"),
-                "properties": dict(node.get("properties") or {}),
+                "properties": props,
             }
         for source, relations in lp.adj.items():
             from_space = (lp.nodes.get(source) or {}).get("space")
@@ -906,6 +913,16 @@ def _hydrate_from_zip(zip_path: str, pack: str | None = None) -> dict:
                 buf["edges"].append({"from_space": from_space, "from_id": source,
                                      "relation": relation, "to_space": to_space,
                                      "to_id": target, "properties": {}})
+        checks_p = os.path.join(path, "quality", "checks.json")
+        if os.path.isfile(checks_p):
+            try:
+                buf["quality_checks"] = json.load(open(checks_p, encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+        # 재저장은 연 자리(원본 서가)로 돌아가야 한다 — 설정 서가로 가면 정본이
+        # 두 갈래가 된다. {서가}/{책}/note-pack 구조에서 서가를 기억해 둔다.
+        if base == "note-pack" and parent:
+            PACK_DESTINATIONS[pack] = os.path.dirname(os.path.dirname(os.path.normpath(path)))
         _persist(pack)
         return {"authoring_pack": pack,
                 "counts": {"nodes": len(buf["nodes"]), "edges": len(buf["edges"])},
@@ -1301,6 +1318,10 @@ def pack_open_local(zip_path: str, mode: str = "read_only") -> dict:
     except Exception as e:
         return {"error": f"열기 실패: {e}",
                 "hint": "경로가 바뀌었거나 zip·note-pack 폴더가 아닐 수 있습니다. pack_list_local()로 현재 팩 목록을 확인하세요."}
+    if isinstance(r, dict) and not (r.get("counts") or {}).get("nodes"):
+        return {"error": "팩이 아닌 폴더/zip 같습니다 (노드 0개).",
+                "hint": ("노트팩은 {책}/note-pack/ 폴더 — frontmatter에 node_id가 있는 "
+                         "노트들 + *-MOC.md — 여야 합니다. pack_list_local()로 서가를 확인하세요.")}
     if mode == "authoring" and isinstance(r, dict) and "error" not in r:
         h = _hydrate_from_zip(zip_path)
         if "error" in h:
@@ -1893,6 +1914,12 @@ def _write_notepack(buf: dict, pack: str, note_dir: str, today: str) -> dict:
                 continue
             sv = str(v)
             L.append(f"{k}: " + (f'"{sv}"' if re.search(r'[:#\[\]{}"]', sv) else sv))
+        # 문자열 locator("3쪽" 등)는 행:: 범위로 표현이 안 되므로 frontmatter로
+        # 왕복시킨다 — 안 하면 이어편집 재저장이 G2(locator 누락)에 막힌다.
+        if n.get("space") == "evidence" and isinstance(p.get("source_locator"), str) \
+                and p["source_locator"]:
+            sv = p["source_locator"]
+            L.append("source_locator: " + (f'"{sv}"' if re.search(r'[:#\[\]{}"]', sv) else sv))
         L += ["---", f"## {label(nid)}"]
         if p.get("label") and p.get("label_ko") and p["label"] != p["label_ko"]:
             L.append(f"*{p['label']}*")
@@ -2010,6 +2037,10 @@ def _save_notepack(buf: dict, pack: str, authoring_quality: dict,
     os.makedirs(qdir, exist_ok=True)
     open(os.path.join(qdir, "ledger.json"), "w", encoding="utf-8").write(
         json.dumps(ledger, ensure_ascii=False, indent=2))
+    # 검수 질문도 팩의 일부다 — 동봉해야 이어편집 재저장이 G6에 안 막힌다.
+    if buf.get("quality_checks"):
+        open(os.path.join(qdir, "checks.json"), "w", encoding="utf-8").write(
+            json.dumps(buf["quality_checks"], ensure_ascii=False, indent=2))
     open(os.path.join(qdir, "pack-contract.json"), "w", encoding="utf-8").write(
         json.dumps(_pack_contract(buf["nodes"], buf["edges"]),
                    ensure_ascii=False, indent=2))

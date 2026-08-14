@@ -180,3 +180,22 @@ def test_pilot_odyssey_notepack_grounded(monkeypatch):
     assert ans["status"] == "grounded"
     assert ans.get("claims"), "노트팩에서 Claim 층이 답하지 않았다"
     assert ans["retrieval_trace"]["axis_receipts"]["lexical"]["hits"] > 0
+
+
+def test_label_shadow_does_not_steal_stem_resolution(tmp_path, monkeypatch):
+    """동라벨 쌍(Event/Evidence)에서 먼저 걸은 노드의 라벨 폴백이 나중 노드의
+    파일명(스템)을 선점하면 엣지가 엉뚱한 노드에 붙는다 (삼국지 300건 실측)."""
+    monkeypatch.setenv("YUPACK_EMBED_MODEL", "none")
+    refresh_embed_model()
+    root = str(tmp_path / "np")
+    # event/ 폴더가 evidence/보다 먼저 걸린다 (알파벳 순) — 이벤트가 라벨을 선점 시도
+    _note(f"{root}/event/마초 의심-2.md", "마초 의심", "Event", "evt:1",
+          "사건 서술")
+    _note(f"{root}/evidence/마초 의심.md", "마초 의심", "TextUnit", "ev:1",
+          "근거 본문\n\n행:: 1~3")
+    _note(f"{root}/evidence/장면.md", "장면", "TextUnit", "ev:scene",
+          "장면 요약\n\ncontains_segment:: [[마초 의심]]\nrecords:: [[마초 의심-2]]")
+    lp = LocalPack(root)
+    # [[마초 의심]]은 파일명이 정확히 일치하는 evidence로, [[마초 의심-2]]는 event로
+    assert ["contains_segment", "ev:1"] in lp.adj["ev:scene"], lp.adj["ev:scene"]
+    assert ["records", "evt:1"] in lp.adj["ev:scene"], lp.adj["ev:scene"]

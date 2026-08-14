@@ -703,7 +703,7 @@ class LocalPack:
                 if not fm.get("type") or fm.get("type") == "MOC":
                     continue  # MOC·프론트매터 없는 문서는 노드가 아니다
                 nid = fm.get("node_id") or os.path.splitext(f)[0]
-                rels, locator, orig, kept = [], None, None, []
+                rels, locator, orig, kept, ev_links = [], None, None, [], []
                 for ln in body.splitlines():
                     m = self._REL_LINE.match(ln.strip())
                     if m:
@@ -717,6 +717,12 @@ class LocalPack:
                     if m3:
                         orig = m3.group(1)
                         continue
+                    # "### 근거"의 근거 링크는 그래마 층의 일부다 — evidence_refs로
+                    # 복원해야 Theme·Claim의 근거 연결이 왕복한다 (G4 왕복 실측).
+                    m4 = re.match(r"^- 근거:\s*\[\[(.+?)\]\]", ln.strip())
+                    if m4:
+                        ev_links.append(m4.group(1))
+                        continue
                     kept.append(ln)
                 body_text = re.sub(r"^#+\s.*$", "", "\n".join(kept), flags=re.M).strip()
                 extras = {k: v for k, v in fm.items()
@@ -725,14 +731,19 @@ class LocalPack:
                 notes.append({"id": nid, "label": fm.get("title") or os.path.splitext(f)[0],
                               "type": fm.get("type"), "space": fm.get("space"),
                               "aliases": fm.get("aliases") or [],
-                              "extras": extras,
+                              "extras": extras, "ev_links": ev_links,
                               "body": body_text, "rels": rels, "locator": locator,
                               "orig": orig, "stem": os.path.splitext(f)[0]})
         self.manifest_hash = h.hexdigest()
         self.integrity = "notepack"
+        # 파일명(스템)은 링크의 정본 좌표라 절대 우선으로 전수 등록하고, 라벨은
+        # 손으로 쓴 링크용 폴백으로 빈자리만 채운다. 한 패스로 섞으면 먼저 걸은
+        # 노드의 라벨이 나중 노드의 스템 자리를 선점해 동라벨 쌍(Event/Evidence)
+        # 에서 엣지가 엉뚱한 노드에 붙는다 (삼국지 300건 실측, 2026-08-13).
         stem2id: dict[str, str] = {}
         for n in notes:
             stem2id.setdefault(n["stem"], n["id"])
+        for n in notes:
             stem2id.setdefault(n["label"], n["id"])
         self.nodes, self.evidence, self.adj = {}, {}, {}
         for n in notes:
@@ -749,6 +760,10 @@ class LocalPack:
                 props["locator"] = n["locator"]
             if n["orig"]:
                 props["source_path"] = n["orig"]
+            if n.get("ev_links"):
+                refs = [stem2id[s] for s in n["ev_links"] if s in stem2id]
+                if refs:
+                    props["evidence_refs"] = refs
             self.nodes[n["id"]] = {"id": n["id"], "space": space, "node_type": n["type"],
                                     "label": n["label"], "properties": props}
             if space == "evidence":
