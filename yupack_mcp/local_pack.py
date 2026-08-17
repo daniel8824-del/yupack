@@ -17,6 +17,7 @@ import re
 import sqlite3
 import struct
 import tempfile
+import threading
 import urllib.request
 import zipfile
 
@@ -109,6 +110,48 @@ _EN_STOPWORDS = {"the", "a", "an", "is", "are", "was", "were", "be", "been", "of
                  "what", "who", "whom", "when", "where", "why", "how", "which", "that",
                  "this", "these", "those", "do", "does", "did", "it", "its", "his", "her",
                  "their", "there", "have", "has", "had", "not", "than", "then", "so"}
+
+# 라틴·한글이 붙어 있으면("Laura는") 한 토큰이 되어 FTS가 고유명사를 잃고,
+# "인물인가" 같은 의문 어미를 글자 절단하면 "인물*"이 팩 전체를 덮는다.
+_TOKEN_RE = re.compile(r"[A-Za-z0-9]+|[가-힣]+")
+_KO_TAIL = re.compile(
+    r"(은|는|이|가|을|를|의|에|에서|으로|로|와|과|도|만|부터|까지|인가|일까|까요)$")
+_KO_STOP = {"은", "는", "이", "가", "을", "를", "의", "에", "와", "과", "도", "만",
+            "로", "으로", "에서", "부터", "까지"}
+_EXTRACT_GUARD = threading.Lock()
+_EXTRACT_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _query_tokens(q: str) -> list[str]:
+    """질의 토큰. 스크립트 경계에서 자르고 단독 조사는 버린다."""
+    out = []
+    for t in _TOKEN_RE.findall(q or ""):
+        if t in _KO_STOP:
+            continue
+        if len(t) >= 2 or re.fullmatch(r"[가-힣]", t):
+            out.append(t)
+    return out
+
+
+def _fts_stem(t: str) -> str:
+    """한글 조사·의문 어미를 한 번만 벗긴다. 라틴 고유명사는 그대로 둔다."""
+    if re.fullmatch(r"[A-Za-z0-9]+", t):
+        return t
+    stripped = _KO_TAIL.sub("", t)
+    return stripped or t
+
+
+def _extract_lock(path: str) -> threading.Lock:
+    with _EXTRACT_GUARD:
+        return _EXTRACT_LOCKS.setdefault(path, threading.Lock())
+
+
+def _qmd_env() -> dict:
+    # 에이전트 하네스가 CI=true를 넣으면 qmd가 쿼리 임베딩을 거절한다.
+    # 사용자가 고른 qmd 백엔드가 환경 플래그 때문에 빈 결과로 위장되면 안 된다.
+    env = os.environ.copy()
+    env.pop("CI", None)
+    return env
 
 
 _HANDLES: dict[str, "LocalPack"] = {}
@@ -205,29 +248,36 @@ def _qmd_ensure_collection(pack_id: str, nodes: dict) -> str | None:
         except Exception:
             continue
     try:
-        r = subprocess.run(["qmd", "collection", "show", col], capture_output=True, text=True, timeout=30)
+        env = _qmd_env()
+        r = subprocess.run(["qmd", "collection", "show", col], capture_output=True,
+                           text=True, timeout=30, env=env)
         if r.returncode != 0 or col not in (r.stdout + r.stderr):
             subprocess.run(["qmd", "collection", "add", d, "--name", col],
-                            capture_output=True, text=True, timeout=60)
+                            capture_output=True, text=True, timeout=60, env=env)
         if wrote:
-            subprocess.run(["qmd", "update"], capture_output=True, text=True, timeout=300)
-        subprocess.run(["qmd", "embed", "-c", col], capture_output=True, text=True, timeout=600)
+            subprocess.run(["qmd", "update"], capture_output=True, text=True, timeout=300, env=env)
+        subprocess.run(["qmd", "embed", "-c", col], capture_output=True, text=True, timeout=600, env=env)
         return col
     except Exception:
         return None
 
 
-def _qmd_vector_search(col: str, q: str, k: int) -> list[dict]:
+def _qmd_vector_search(col: str, q: str, k: int) -> tuple[list[dict], str]:
+    """QMD 벡터 검색. 실패는 빈 배열+사유. rc를 무시하고 ok로 위장하지 않는다."""
     import subprocess
     if not q:
-        return []
+        return [], "unavailable: empty query"
     try:
-        out = subprocess.run(["qmd", "query", "vec: " + q, "-c", col, "-n", str(k)],
-                              capture_output=True, text=True, timeout=90).stdout
-    except Exception:
-        return []
+        proc = subprocess.run(["qmd", "query", "vec: " + q, "-c", col, "-n", str(k)],
+                              capture_output=True, text=True, timeout=90, env=_qmd_env())
+    except Exception as e:
+        return [], f"error: qmd 실행 실패 ({type(e).__name__})"
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip().splitlines()
+        tail = err[-1] if err else f"rc={proc.returncode}"
+        return [], f"error: qmd rc={proc.returncode}: {tail[:180]}"
     hits, cur = [], None
-    for ln in out.splitlines():
+    for ln in proc.stdout.splitlines():
         m = re.match(rf"qmd://{re.escape(col)}/(.+?)\.md", ln.strip())
         if m:
             cur = m.group(1).replace("__", ":")
@@ -236,7 +286,7 @@ def _qmd_vector_search(col: str, q: str, k: int) -> list[dict]:
         if m2 and cur:
             hits.append({"id": cur, "cosine": int(m2.group(1)) / 100.0, "text": ""})
             cur = None
-    return hits[:k]
+    return hits[:k], "ok"
 
 
 def _jsonl(text: str) -> list[dict]:
@@ -564,10 +614,16 @@ class LocalPack:
         self.manifest_hash = _sha256(raw)
         self.cache = os.path.join(tempfile.gettempdir(),
                                   "yupack-" + self.manifest_hash[:12])
-        if not os.path.exists(os.path.join(self.cache, ".ok")):
-            with zipfile.ZipFile(io.BytesIO(raw)) as z:
-                z.extractall(self.cache)
-            open(os.path.join(self.cache, ".ok"), "w").write("ok")
+        ok = os.path.join(self.cache, ".ok")
+        with _extract_lock(self.cache):
+            if not os.path.exists(ok):
+                os.makedirs(self.cache, exist_ok=True)
+                with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                    z.extractall(self.cache)
+                with open(ok, "w") as f:
+                    f.write("ok")
+                    f.flush()
+                    os.fsync(f.fileno())
         # ZIP은 평면형과 wrapper/graph/형을 모두 허용한다. nodes.jsonl이
         # 있는 디렉터리 하나만 고르면 graph/의 형제 index/evidence를 놓친다.
         # __MACOSX/._ 메타데이터는 후보에서 제외하고 계약 마커가 가장 많은
@@ -1233,36 +1289,42 @@ class LocalPack:
     # --- retrieval 3종 ---
     @staticmethod
     def _fts_terms(toks: list[str]) -> list[str]:
-        # 한국어 조사 대응: 각 토큰의 절단형(prefix*)도 함께 질의 ("프랑스혁명이" -> 프랑스혁명*)
-        # 1글자 한글(소·개·활)은 정확 일치로만 질의 (prefix는 소음)
+        # 조사·의문 어미는 stem 한 번만. 글자 절단 prefix는 stem 이후 긴 토큰에만
+        # 붙인다 ("프랑스혁명이" -> "프랑스혁명"). "인물인가" -> "인물" 정확 일치.
         terms = []
         for t in toks[:12]:
-            terms.append(f'"{t}"')
-            if len(t) == 1:
+            stem = _fts_stem(t)
+            terms.append(f'"{stem}"')
+            if stem != t:
+                terms.append(f'"{t}"')
+            if len(stem) < 4:
                 continue
-            for cut in (t[:-1], t[:-2]):
-                if len(cut) >= 2:
-                    terms.append(f'"{cut}" *'.replace('" *', '"*'))
-                elif len(cut) == 1 and re.fullmatch(r"[가-힣]", cut):
-                    terms.append(f'"{cut}"')
+            if re.fullmatch(r"[A-Za-z0-9]+", stem):
+                for cut in (stem[:-1], stem[:-2]):
+                    if len(cut) >= 3:
+                        terms.append(f'"{cut}"*')
+            elif re.fullmatch(r"[가-힣]+", stem) and stem == t:
+                for cut in (stem[:-1], stem[:-2]):
+                    if len(cut) >= 2:
+                        terms.append(f'"{cut}"*')
         return terms
 
     def lexical(self, q: str, k: int = 8) -> list[dict]:
         # 축 영수증: 실패를 빈 배열로 숨기지 않고 사유를 남긴다 (관측 계약)
         self._lexical_receipt = {"status": "ok", "hits": 0}
-        toks = [t for t in re.findall(r"[\w가-힣]+", q)
-                if len(t) >= 2 or re.fullmatch(r"[가-힣]", t)]
+        toks = _query_tokens(q)
         if not toks:
             return []
         mem = getattr(self, "_fts_conn", None)
+        match = " OR ".join(dict.fromkeys(self._fts_terms(toks)))
         if mem is not None:
             # 노트팩: 폴더 파싱 시 만든 인메모리 FTS가 zip의 fts.sqlite를 대체한다
             try:
                 with self._fts_lock:
                     rows = mem.execute(
                         "SELECT id, kind, bm25(docs) FROM docs WHERE docs MATCH ? "
-                        "ORDER BY bm25(docs) LIMIT ?",
-                        (" OR ".join(dict.fromkeys(self._fts_terms(toks))), k)).fetchall()
+                        "ORDER BY bm25(docs), id LIMIT ?",
+                        (match, k)).fetchall()
             except sqlite3.OperationalError:
                 rows = []
                 self._lexical_receipt = {"status": "error: FTS 질의 실패", "hits": 0}
@@ -1275,8 +1337,7 @@ class LocalPack:
         if not os.path.exists(p):
             self._lexical_receipt = {"status": "unavailable: lexical-index가 팩에 없음", "hits": 0}
             return []
-        terms = self._fts_terms(toks)
-        con = sqlite3.connect(p)
+        con = sqlite3.connect(p, timeout=30)
         # FTS 스키마는 팩 빌더마다 다르다: 구형은 (id, kind, body),
         # 신형은 (id, work_id, space, node_type, text). 없는 컬럼을 고정 참조하면
         # OperationalError가 나고 어휘 축이 통째로 조용히 죽는다 — 컬럼을 보고 고른다.
@@ -1291,8 +1352,8 @@ class LocalPack:
         try:
             rows = con.execute(
                 f"SELECT {sel} FROM docs WHERE docs MATCH ? "
-                "ORDER BY bm25(docs) LIMIT ?",
-                (" OR ".join(dict.fromkeys(terms)), k)).fetchall()
+                "ORDER BY bm25(docs), id LIMIT ?",
+                (match, k)).fetchall()
         except sqlite3.OperationalError:
             rows = []
             self._lexical_receipt = {"status": "error: FTS 질의 실패", "hits": 0}
@@ -1377,11 +1438,11 @@ class LocalPack:
         if EMBED_MODEL == "qmd":
             col = self._qmd_col_lazy()
             if col:
-                hits = _qmd_vector_search(col, q, k)
+                hits, qmd_status = _qmd_vector_search(col, q, k)
                 s2i = getattr(self, "_qmd_slug2id", {})
                 for h in hits:
                     h["id"] = s2i.get(re.sub(r"[^a-z0-9]+", "-", h["id"].lower()), h["id"])
-                self._vector_receipt = {"status": "ok", "backend": "qmd", "hits": len(hits)}
+                self._vector_receipt = {"status": qmd_status, "backend": "qmd", "hits": len(hits)}
                 return hits
             self._vector_receipt = {"status": "unavailable: qmd 컬렉션 준비 실패",
                                     "backend": "qmd", "hits": 0}
@@ -1623,12 +1684,11 @@ class LocalPack:
                 # 순위 기여는 임계값 없이(교차언어 질의는 절대 코사인이 낮게 나옴),
                 # 임계값(thr)은 아래 근거 게이트(vec_strong) 판정에만 쓴다
                 score[h["id"]] = score.get(h["id"], 0) + 1.0 / (RRF_K + i) + (0.05 if h["cosine"] >= thr else 0)
-        ranked = sorted(score.items(), key=lambda kv: -kv[1])
+        ranked = sorted(score.items(), key=lambda kv: (-kv[1], kv[0]))
         # 근거 게이트: 벡터(>=0.76) 또는 강한 어휘 일치(4자+ 토큰 정확 일치 / 2토큰 교집합)
         # 한글 1글자 단어(활·눈·신 등)는 의미어라 게이트 토큰에 포함한다
         def _gtok(s):
-            return {t for t in re.findall(r"[\w가-힣]+", s)
-                    if len(t) >= 2 or re.fullmatch(r"[가-힣]", t)}
+            return set(_query_tokens(s))
         # 영어 번역 질의의 불용어는 게이트에서 뺀다: "the"/"for"가 3글자라 단독으로
         # 강한 어휘 일치 판정을 통과시키던 문제 (한글 3글자=의미어 규칙의 영어 오적용)
         q_toks = {t for t in (_gtok(question) | (_gtok(q_en) if q_en else set()))
@@ -1688,7 +1748,7 @@ class LocalPack:
                     corder.append(t["to"])
             for i, nid in enumerate(corder):
                 score[nid] = score.get(nid, 0.0) + 1.0 / (RRF_K + i + 1)
-            ranked = sorted(score.items(), key=lambda kv: -kv[1])
+            ranked = sorted(score.items(), key=lambda kv: (-kv[1], kv[0]))
         # 발견 순서(시드 -> 가까운 홉부터)로 카드화: 무작위 set 순서로 레버가 잘리는 문제 방지
         # 인과 경로 노드를 배관 evidence보다 앞세운다 (top_k를 evidence가 전부 점유하던 문제)
         # 인과 경로 위의 노드와 그 위에 걸린 Claim·Evidence를 최우선으로 카드화한다.
