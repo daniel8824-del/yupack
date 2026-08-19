@@ -205,9 +205,12 @@ def _qmd_doc_text(n: dict) -> str:
     alias = p.get("aliases_ko") or []
     if isinstance(alias, str):
         alias = [alias]
+    # summary·description 누락 주의: 노트팩은 한국어 본문이 summary에만 있는 경우가 있다
+    # (label_ko가 영어 node_id인 팩도 존재). 빠지면 한국어 질의가 벡터 축에서 통째로 죽는다.
     return " ".join(str(x) for x in [n.get("label") or p.get("label"), p.get("label_ko"), *alias,
-                                      p.get("text"), p.get("definition"), p.get("statement"),
-                                      p.get("mechanism")] if x)[:1500]
+                                      p.get("text"), p.get("summary"), p.get("definition"),
+                                      p.get("statement"), p.get("mechanism"),
+                                      p.get("description")] if x)[:1500]
 
 
 def _node_embedding_text(n: dict) -> str:
